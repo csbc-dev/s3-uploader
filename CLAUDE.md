@@ -1,22 +1,22 @@
 # CLAUDE.md
 
-このリポジトリ (`@csbc-dev/s3-uploader`) は [`@wc-bindable/s3`](https://github.com/wc-bindable-protocol/wc-bindable-protocol/tree/main/packages/s3) を起点として、csbc-dev/arch のアーキテクチャ群の一員として再パッケージしたものです。設計思想を理解するうえで前提となる 2 つのドキュメントを以下にまとめます。
+This repository (`@csbc-dev/s3-uploader`) is a re-packaged member of the `csbc-dev/arch` architecture family, originating from [`@wc-bindable/s3`](https://github.com/wc-bindable-protocol/wc-bindable-protocol/tree/main/packages/s3). The two background documents below are required reading for the design intent; a third section covers what is specific to **this** package.
 
 ---
 
-## 1. wc-bindable-protocol の概要
+## 1. Overview of wc-bindable-protocol
 
-`EventTarget` を継承する任意のクラスが、自身のリアクティブなプロパティを宣言するためのフレームワーク非依存・最小プロトコル。React / Vue / Svelte / Angular / Solid などのリアクティビティシステムが、フレームワーク固有のグルーコードを書かずに任意のコンポーネントに束縛できるようにする。
+A framework-agnostic, minimal protocol that lets any class extending `EventTarget` declare its reactive properties. Reactivity systems in React / Vue / Svelte / Angular / Solid can then bind to arbitrary components without framework-specific glue code.
 
-### コアアイデア
+### Core idea
 
-- コンポーネント作者は **何が** バインド可能かを宣言する
-- フレームワーク利用側は **どう** バインドするかを決める
-- 双方は互いを知らなくてよい
+- The component author declares **what** is bindable.
+- The framework consumer decides **how** to bind it.
+- Neither side needs to know about the other.
 
-### 宣言の仕方
+### How to declare
 
-`static wcBindable` フィールドにスキーマを書くだけ。
+Just write a schema in the `static wcBindable` field.
 
 ```javascript
 class MyFetchCore extends EventTarget {
@@ -27,98 +27,182 @@ class MyFetchCore extends EventTarget {
       { name: "value",   event: "my-fetch:value-changed" },
       { name: "loading", event: "my-fetch:loading-changed" },
     ],
-    inputs:   [{ name: "url" }, { name: "method" }],   // 任意
-    commands: [{ name: "fetch", async: true }, { name: "abort" }],  // 任意
+    inputs:   [{ name: "url" }, { name: "method" }],   // optional
+    commands: [{ name: "fetch", async: true }, { name: "abort" }],  // optional
   };
 }
 ```
 
-| フィールド | 必須 | 役割 |
+| Field | Required | Role |
 |---|---|---|
-| `properties` | ✅ | 状態変化を `CustomEvent` で通知するプロパティ群（出力） |
-| `inputs` | — | 設定可能なプロパティ（入力。宣言のみで自動同期はしない） |
-| `commands` | — | 呼び出し可能なメソッド（リモートプロキシやツーリング向け） |
+| `properties` | ✅ | Properties that announce state changes via `CustomEvent` (output) |
+| `inputs` | — | Configurable properties (input; declarative only — no auto-sync) |
+| `commands` | — | Invokable methods (for remote proxies and tooling) |
 
-### バインドの仕組み
+### How binding works
 
-アダプタは以下を行うだけ：
+An adapter only needs to:
 
-1. `target.constructor.wcBindable` を読む
-2. `protocol === "wc-bindable" && version === 1` を確認
-3. 各 `property` について `target[name]` を即時読み取って初期値を配信し、続いて `event` を購読する
+1. Read `target.constructor.wcBindable`.
+2. Verify `protocol === "wc-bindable" && version === 1`.
+3. For each `property`, read `target[name]` immediately to deliver the initial value, then subscribe to `event`.
 
-`bind()` は実装たかだか 20 行。フレームワークアダプタも数十行で書ける。
+`bind()` is at most ~20 lines. Framework adapters fit in a few dozen lines.
 
-### スコープ外（意図的）
+### Out of scope (deliberately)
 
-- 自動双方向同期（入力反映は呼び出し側の責任）
-- フォーム統合
-- SSR / hydration
-- 値の型検証 / スキーマ検証
+- Automatic two-way sync (reflecting input is the caller's responsibility).
+- Form integration.
+- SSR / hydration.
+- Runtime type or schema validation.
 
-### なぜ EventTarget か
+### Why `EventTarget`?
 
-`HTMLElement` ではなく `EventTarget` を最小要件にしているため、Node.js / Deno / Cloudflare Workers などブラウザ外ランタイムでも同じプロトコルが動作する。`HTMLElement` は `EventTarget` のサブクラスなので Web Components は自動的に互換。
+Requiring `EventTarget` rather than `HTMLElement` lets the same protocol run in non-browser runtimes such as Node.js / Deno / Cloudflare Workers. `HTMLElement` is a subclass of `EventTarget`, so Web Components are automatically compatible.
 
-参考: [wc-bindable-protocol/SPEC.md](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/SPEC.md)
+Reference: [wc-bindable-protocol/SPEC.md](https://github.com/wc-bindable-protocol/wc-bindable-protocol/blob/main/SPEC.md)
 
 ---
 
-## 2. Core/Shell Bindable Component (CSBC) アーキテクチャの概要
+## 2. Overview of the Core/Shell Bindable Component (CSBC) architecture
 
-wc-bindable-protocol を土台に、**業務ロジック（特に非同期処理）をフレームワーク層から Web Component 側に移すこと** で、フレームワークロックインを構造的に解消するアーキテクチャ。
+Built on top of wc-bindable-protocol, CSBC structurally eliminates framework lock-in by **moving business logic — particularly async work — out of the framework layer and into the Web Component side**.
 
-### 解こうとする問題
+### The problem it solves
 
-フレームワーク移行コストの真の発生源は UI の互換性ではなく、**フレームワーク固有のライフサイクル API（`useEffect` / `onMounted` / `onMount` …）と密結合した async ロジック** である。テンプレートは機械的に書き換えられても、async コードは意味理解を要求するため移植コストが跳ね上がる。
+The real cost of a framework migration is not UI compatibility but the **async logic that is tightly coupled to framework-specific lifecycle APIs (`useEffect` / `onMounted` / `onMount` / …)**. Templates can be rewritten mechanically, but async code requires semantic understanding, so porting it explodes the migration cost.
 
-### 三層構造
+### Three-layer structure
 
-1. **Headless Web Component 層** — fetch / WebSocket / タイマー等の async 処理と状態 (`value`, `loading`, `error`, …) を内部に封じ込める。UI は持たず、純粋なサービス層として振る舞う。
-2. **Protocol 層 (wc-bindable-protocol)** — 上記の状態を `static wcBindable` + `CustomEvent` で外に開く。
-3. **Framework 層** — 薄いアダプタでプロトコルに接続し、受け取った状態を描画する。**async コードはここに一切書かない**。
+1. **Headless Web Component layer** — encapsulates async work (fetch / WebSocket / timers / …) and state (`value`, `loading`, `error`, …) inside the component. It has no UI and behaves as a pure service layer.
+2. **Protocol layer (wc-bindable-protocol)** — exposes that state to the outside via `static wcBindable` + `CustomEvent`.
+3. **Framework layer** — connects to the protocol through a thin adapter and renders the received state. **No async code is written here.**
 
-### Core / Shell の分離
+### Core / Shell separation
 
-Headless 層は更に二つに分解される。**唯一の不変条件は「Shell が常に薄い」ことではなく、決定権の所在**：
+The headless layer is further split in two. **The invariant is not "the Shell is always thin" — it is where decisions live**:
 
-- **Core (`EventTarget`) — 決定を持つ**
-  業務ロジック、ポリシー、状態遷移、認可関連の振る舞い、イベント発火。DOM 非依存にできれば Node.js / Deno / Workers にも持ち運べる。
-- **Shell (`HTMLElement`) — 委譲できない実行のみを持つ**
-  フレームワーク接続、DOM ライフサイクル、ブラウザでしか実行できない処理。
+- **Core (`EventTarget`) — owns decisions.**
+  Business logic, policy, state transitions, authorization-related behavior, event emission. If kept DOM-independent, it is portable to Node.js / Deno / Workers.
+- **Shell (`HTMLElement`) — owns only the execution that cannot be delegated.**
+  Framework wiring, DOM lifecycle, anything that has to run in the browser.
 
-設計上の鍵は **target 注入** パターン: Core のコンストラクタが任意の `EventTarget` を受け取り、すべてのイベントをそこへディスパッチする。Shell が `this` を渡せば、Core のイベントが直接 DOM 要素から発火し、再ディスパッチが不要になる。
+The design key is the **target injection** pattern: the Core's constructor accepts an arbitrary `EventTarget` and dispatches every event to it. When the Shell passes `this`, the Core's events fire directly from the DOM element and re-dispatch is unnecessary.
 
-### 4 つの正準ケース
+### Four canonical cases
 
-| ケース | Core の場所 | Shell の役割 | 例 |
+| Case | Where the Core lives | What the Shell does | Example |
 |---|---|---|---|
-| A | ブラウザ | ブラウザ依存 Core の薄いラッパ | `auth0-gate` (local) |
-| B1 | サーバ | コマンド仲介・プロキシ型の薄い Shell | `ai-agent` (remote) |
-| B2 | サーバ | 観測専用の薄い Shell（リモートセッション購読のみ） | `feature-flags` |
-| C | サーバ | ブラウザ固定のデータプレーンを実行する Shell | **`s3-uploader`**, `passkey-auth`, `stripe-checkout` |
+| A | Browser | Thin wrapper around a browser-bound Core | `auth0-gate` (local) |
+| B1 | Server | Thin Shell that brokers commands as a proxy | `ai-agent` (remote) |
+| B2 | Server | Observation-only Shell that subscribes to a remote session | `feature-flags` |
+| C | Server | Shell that runs a browser-only data plane | **`s3-uploader`**, `passkey-auth`, `stripe-checkout` |
 
-ケース C は CSBC の原則からの逸脱ではなく **第一級のケース**。ブラウザでしか実行できないデータプレーン（直接アップロード、WebRTC、WebUSB、`File System Access API`、ユーザジェスチャ依存の処理、PCI スコープを避けるための Stripe Elements など）が存在するときに発生する。Shell が太くなっても、**意思決定が Core にある限り** CSBC 違反ではない。
+Case C is **not** a deviation from CSBC principles — it is a **first-class case**. It arises whenever there is a data plane that can only run in the browser (direct upload, WebRTC, WebUSB, the `File System Access API`, anything dependent on a user gesture, Stripe Elements to keep PCI scope off the server, …). A "fat" Shell is fine **as long as decisions still live in the Core**.
 
-> 不変条件:
-> **Core はすべての決定を持つ。Shell は委譲できない実行だけを持つ。**
+> Invariant:
+> **The Core owns every decision. The Shell only does what cannot be delegated.**
 
-### 横断する 3 つの境界
+### Three boundaries it crosses
 
-| 境界 | 横断する主体 | メカニズム |
+| Boundary | Crosser | Mechanism |
 |---|---|---|
-| ランタイム境界 | Core (`EventTarget`) | DOM 非依存。Node / Deno / Workers で動作 |
-| フレームワーク境界 | Shell (`HTMLElement`) | 属性マッピング + `ref` バインディング |
-| ネットワーク境界 | `@wc-bindable/remote` | プロキシ EventTarget + JSON ワイヤープロトコル |
+| Runtime boundary | Core (`EventTarget`) | DOM-independent. Runs on Node / Deno / Workers. |
+| Framework boundary | Shell (`HTMLElement`) | Attribute mapping + `ref` binding. |
+| Network boundary | `@wc-bindable/remote` | Proxy `EventTarget` + JSON wire protocol. |
 
-`@wc-bindable/remote` は `RemoteShellProxy`（サーバ側）と `RemoteCoreProxy`（クライアント側）のペアで、Core をサーバへ完全に押し出しつつクライアント側の `bind()` を変えずに動かす。トランスポートは WebSocket がデフォルトだが、最小インタフェース (`ClientTransport` / `ServerTransport`) を満たせば MessagePort / BroadcastChannel / WebTransport などに差し替え可能。
+`@wc-bindable/remote` is a pair of `RemoteShellProxy` (server side) and `RemoteCoreProxy` (client side). It pushes the Core fully onto the server while keeping the client-side `bind()` unchanged. WebSocket is the default transport; anything that satisfies the minimal `ClientTransport` / `ServerTransport` interfaces (MessagePort / BroadcastChannel / WebTransport / …) can be swapped in.
 
-### 本パッケージにおける位置付け
+### Where this package sits
 
-`@csbc-dev/s3-uploader` は **ケース C**: アップロードに関するすべての決定 — プレサインド URL の発行、AWS 認証情報の保持、SigV4 署名、multipart の制御プレーン (Initiate / Complete / Abort)、`registerPostProcess` フック実行 — は `S3Core` (Core, `EventTarget`) がサーバ側で持つ。`<s3-uploader>` (Shell, `HTMLElement`) はブラウザ固定のデータプレーン、すなわち File ピックアップ・S3 への直接 PUT (単発 / per-part)・進捗レポート・abort ハンドリングだけを担う。
+`@csbc-dev/s3-uploader` is a **Case C** package. Every decision about an upload — minting presigned URLs, holding AWS credentials, SigV4 signing, the multipart control plane (Initiate / Complete / Abort), running `registerPostProcess` hooks — is owned by `S3Core` (the Core, an `EventTarget`) on the server. `<s3-uploader>` (the Shell, an `HTMLElement`) handles only the browser-anchored data plane: file picking, direct PUT to S3 (single or per-part), progress reporting, and abort handling.
 
-> **バイト列は WebSocket を通らない。** 通信路を流れるのは署名要求、進捗（rAF コアレス済み）、完了通知のみで、ファイル本体はブラウザから S3 へ直接 PUT される。結果としてサーバコストはアップロードサイズに依存せず `O(connections × signing_rate)` で済む。
+> **Bytes never traverse the WebSocket.** What flows through the channel is signing requests, progress events (rAF-coalesced), and completion notifications; the file body goes straight from the browser to S3. As a result, server cost does **not** scale with upload size — it scales as `O(connections × signing_rate)`.
 
-リモート Core により AWS 認証情報がブラウザに露出することはなく、prefix によるテナント分離・content-type 許可リスト・post-process フックでの DB 書き込みやウィルススキャン等の意思決定はすべてサーバ側で完結する。AWS SDK には依存せず、SigV4 は Web Crypto API で実装する（`@wc-bindable/core` と `@wc-bindable/remote` のみがランタイム依存）。
+Because the Core is remote, AWS credentials are never exposed to the browser, and decisions like prefix-based tenant isolation, content-type allowlists, or post-process hook work (DB writes, virus scanning, …) are all settled server-side. The package does not depend on the AWS SDK; SigV4 is implemented with the Web Crypto API. The only runtime dependencies are `@wc-bindable/core` and `@wc-bindable/remote`.
 
-参考: [csbc-dev/arch (旧 hawc)](https://github.com/csbc-dev/arch/blob/main/README.md)
+Reference: [csbc-dev/arch (formerly hawc)](https://github.com/csbc-dev/arch/blob/main/README.md)
+
+---
+
+## 3. This package — layout, entry points, conventions
+
+This section is specific to `@csbc-dev/s3-uploader`. For end-user usage, security responsibilities, the component API surface, framework-integration recipes, multipart sizing, retry policy, error taxonomy, etc., the canonical reference is [README.md](README.md). The points below are what an agent working **inside** this repo should know in addition.
+
+### Package metadata
+
+- Package name: `@csbc-dev/s3-uploader` (see [package.json](package.json)).
+- Distribution: ESM only (`"type": "module"`).
+- Runtime dependencies: `@wc-bindable/core`, `@wc-bindable/remote`. **No AWS SDK** — SigV4 is hand-rolled on Web Crypto.
+- Dev dependencies of note: `typescript`, `vitest`, `@playwright/test`, `happy-dom`, `ws`.
+
+### Source layout
+
+```
+src/
+├── index.ts                   ← browser barrel (default export)
+├── server.ts                  ← Node-safe barrel (no HTMLElement-backed code)
+├── bootstrapS3.ts             ← one-shot setup that registers <s3-uploader> / <s3-callback>
+├── config.ts                  ← config store read at element-connect time
+├── registerComponents.ts      ← customElements.define wiring
+├── processEnv.ts              ← reads globalThis.S3_REMOTE_CORE_URL / process.env.S3_REMOTE_CORE_URL
+├── retry.ts                   ← retryWithBackoff, PutHttpError, MissingEtagError, defaultPutRetryPolicy
+├── normaliseError.ts          ← shapes thrown values into Error instances on the wire
+├── raiseError.ts              ← consistent error-dispatch helper for the Shell
+├── types.ts                   ← IS3Provider, PresignedUpload, S3RequestOptions, WcsS3Values, ...
+├── core/
+│   └── S3Core.ts              ← Core (EventTarget). Owns credentials, signing, post-process hooks
+├── components/
+│   ├── S3.ts                  ← <s3-uploader> Shell (HTMLElement)
+│   ├── S3Callback.ts          ← <s3-callback> Shell — Blob-imports inline <script type="module">
+│   ├── remoteConnection.ts    ← WebSocket adapter for RemoteCoreProxy on the browser side
+│   └── xhrUploader.ts         ← XHR-based PUT with progress events and per-PUT retry
+├── providers/
+│   └── AwsS3Provider.ts       ← default IS3Provider; reads AWS_* env vars
+├── signing/
+│   └── sigv4.ts               ← presignS3Url, SkewError, all SigV4 primitives via Web Crypto
+└── auto/
+    ├── auto.{js,d.ts,min.js}        ← side-effect entry: bootstrapS3() with defaults
+    └── remoteEnv.{js,d.ts,min.js}   ← side-effect entry: enables remote mode and reads URL from env
+```
+
+### Public entry points
+
+| subpath | environment | exports |
+|---|---|---|
+| `@csbc-dev/s3-uploader` | browser | `bootstrapS3`, `WcsS3`, `WcsS3Callback`, `S3Core`, `AwsS3Provider`, retry helpers, types |
+| `@csbc-dev/s3-uploader/server` | Node | `S3Core`, `AwsS3Provider`, `presignS3Url`, retry helpers, types — **no `HTMLElement`-based code** |
+| `@csbc-dev/s3-uploader/auto` | browser (side-effect) | calls `bootstrapS3()` so `<s3-uploader>` and `<s3-callback>` register on import |
+| `@csbc-dev/s3-uploader/auto/remoteEnv` | browser (side-effect) | calls `bootstrapS3({ remote: { enableRemote: true, remoteSettingType: "env" } })` and reads the WS URL from `globalThis.S3_REMOTE_CORE_URL` / `process.env.S3_REMOTE_CORE_URL` |
+
+The default barrel is **browser-targeted on purpose**. Importing it from Node fails at module evaluation (`HTMLElement is not defined`); any code that runs outside a browser must use `/server`.
+
+When adding new server-safe helpers, mirror the export in both [src/index.ts](src/index.ts) and [src/server.ts](src/server.ts). When adding browser-only helpers, **only** export them from [src/index.ts](src/index.ts).
+
+### Build & scripts
+
+| script | what it does |
+|---|---|
+| `npm run build` | `tsc` → emits to `dist/` (referenced by `main` / `types` / `exports`) |
+| `npm run dev` | `tsc --watch` |
+| `npm test` | `vitest run __tests__` (unit / DOM tests via happy-dom) |
+| `npm run test:watch` | `vitest __tests__` |
+| `npm run test:integration` | builds, sets up `scripts/setup-integration-packages.mjs`, then runs Playwright |
+| `prepack` | runs `npm run build` automatically on publish |
+
+### Test layout
+
+- `__tests__/` — Vitest unit and DOM tests. Default environment is happy-dom; this is where Core logic, signing, retry policy, and Shell behavior in a fake DOM live.
+- `tests/` — Playwright integration suite invoked by `test:integration`. Requires the build output and the integration-packages setup script.
+
+When fixing a bug, prefer adding a regression test to `__tests__/` first; reach for Playwright only when the failure is genuinely browser-shaped (real XHR progress events, real network, real CORS).
+
+### Conventions specific to this package
+
+- **Class name vs. tag name.** The default tag is `<s3-uploader>` but the exported class is `WcsS3` (with `WcsS3Callback` for `<s3-callback>`). The `Wcs` prefix is the package-wide class namespace shared across `@wc-bindable/*`. When grepping, use the tag name in templates and the class name in JS/TS.
+- **Event-name suffix.** Every observable property dispatches `s3-uploader:<name>-changed` — including booleans like `completed-changed`. The one exception is `error`, which dispatches as `s3-uploader:error` (no suffix) because it is a signal, not a state transition. Renaming this convention requires every binder in the ecosystem to carry a per-property exception table — do not "improve" it locally.
+- **Errors split into two layers.** Package-owned errors (`PutHttpError`, `MissingEtagError`) are exported as classes and unioned under the closed `S3OwnedError` type — adding a new member is a breaking change you can catch at compile time. Upstream errors (`AccessDenied`, transport, CORS, …) are passed through unwrapped as plain `Error` instances. Do not wrap upstream errors in new package classes.
+- **No AWS SDK.** Anything that needs SigV4 goes through [src/signing/sigv4.ts](src/signing/sigv4.ts) on Web Crypto. Adding `aws-sdk` / `@aws-sdk/*` is a non-goal; keep the runtime dependency surface at `@wc-bindable/core` + `@wc-bindable/remote`.
+- **Provider wrapping over forking.** Pre-presign rejection (size cap, content-type allowlist, key-shape checks, per-tenant scoping) is done by wrapping `IS3Provider` and throwing from `presignUpload` / `initiateMultipart`, not by patching `AwsS3Provider`. See the recipe in [README.md](README.md#extension-points).
+- **Configure once, before connect.** `bootstrapS3()` / `setConfig()` is intended to run once before any element is connected to the document. Re-configuring after connect leaves already-connected elements on their cached settings while new ones see the new settings — undefined behavior.
+- **`ws.on("close", () => core.abort())` is load-bearing.** Without it, an interrupted multipart leaves orphan parts in S3 because the client cannot reach `abortMultipart` through a dead control channel. Any new server-example or doc snippet that omits it is wrong.
