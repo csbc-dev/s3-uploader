@@ -22,8 +22,16 @@ function resolveRemoteCoreUrl(cfg: IInternalConfig): string {
     // inject-before-script convention we keep distinct from env resolution.
     const fromEnv = readProcessEnv("S3_REMOTE_CORE_URL");
     if (fromEnv !== undefined) return fromEnv;
-    const fromGlobal = (globalThis as { S3_REMOTE_CORE_URL?: string }).S3_REMOTE_CORE_URL;
-    return fromGlobal ?? "";
+    // Runtime-validate the global. The TypeScript cast below is structural
+    // only: a page that injects `globalThis.S3_REMOTE_CORE_URL = 123` (or
+    // a function, or an object) would otherwise flow a non-string through
+    // to `getRemoteCoreUrl()`'s `string` return and crash the eventual
+    // `new WebSocket(url)` with an opaque message. Coerce non-string
+    // values to the empty string so `validateRemoteCoreUrl` can issue its
+    // own precise "URL not configured" error from a consistent input
+    // shape.
+    const fromGlobal = (globalThis as { S3_REMOTE_CORE_URL?: unknown }).S3_REMOTE_CORE_URL;
+    return typeof fromGlobal === "string" ? fromGlobal : "";
   }
   return cfg.remote.remoteCoreUrl;
 }

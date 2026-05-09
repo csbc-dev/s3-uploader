@@ -6,26 +6,51 @@ import { raiseError } from "../raiseError.js";
 import { readProcessEnv } from "../processEnv.js";
 
 /**
+ * Decode the five XML predefined entities plus numeric character references.
+ * S3-compatible servers can entity-escape user-controlled fields embedded in
+ * `<Code>`, `<Message>`, `<Resource>`, etc. — and an `Error.Message` field
+ * containing the raw `&amp;` / `&lt;` text instead of the decoded character
+ * is misleading at best, broken integrity checks at worst. This is the
+ * minimum-viable decoder for the well-formed payloads we actually see; a
+ * truly hostile XML body still warrants DOMParser.
+ */
+function decodeXmlEntities(s: string): string {
+  return s.replace(/&(#x?[0-9A-Fa-f]+|[a-zA-Z]+);/g, (m, ent: string) => {
+    if (ent === "amp")   return "&";
+    if (ent === "lt")    return "<";
+    if (ent === "gt")    return ">";
+    if (ent === "quot")  return '"';
+    if (ent === "apos")  return "'";
+    if (ent[0] === "#") {
+      // Numeric character reference: &#NN; (decimal) or &#xNN; (hex).
+      const isHex = ent[1] === "x" || ent[1] === "X";
+      const num = parseInt(ent.slice(isHex ? 2 : 1), isHex ? 16 : 10);
+      if (Number.isFinite(num) && num >= 0 && num <= 0x10FFFF) {
+        try { return String.fromCodePoint(num); } catch { return m; }
+      }
+    }
+    return m;
+  });
+}
+
+/**
  * Tolerant single-tag XML extractor. S3 namespaces the tags but the local
- * name is unique enough. Handles namespace-prefixed forms (`<x:tag>...`)
- * and optional XML attributes on the opening tag (`<tag attr="...">`), and
- * captures values that span newlines (pretty-printed XML).
+ * name is unique enough. Handles namespace-prefixed forms (`<x:tag>...`),
+ * optional XML attributes on the opening tag (`<tag attr="...">`), values
+ * that span newlines (pretty-printed XML), and the five XML predefined
+ * entities + numeric character references in the captured value.
  *
  * LIMITATIONS: this is strictly regex-based. It does NOT handle:
  *   - CDATA sections (`<tag><![CDATA[...]]></tag>`) — the inner `]]>` and
  *     `<![CDATA[` markers will leak into the returned value.
- *   - XML entity-escaped content (`&amp;`, `&lt;`, `&#x41;`, etc.) — the
- *     raw entity text is returned, NOT the decoded character.
  *   - Nested tags with the same local name — the lazy `.*?` grabs the first
  *     closing tag, which for well-formed S3 responses is always the intended
  *     one but would mis-parse a hand-crafted pathological document.
  *
  * Real S3 responses for the operations we call (CreateMultipartUpload,
- * CompleteMultipartUpload, error bodies) never use CDATA and only entity-escape
- * `&` / `<` / `>` in user-controlled fields like object keys — which this
- * code path does not re-parse. If a future S3-compatible provider emits
- * entity-escaped `UploadId`, `ETag`, `Code`, or `Message`, swap this to a
- * DOMParser-based extraction.
+ * CompleteMultipartUpload, error bodies) never use CDATA. If a future
+ * S3-compatible provider emits CDATA or pathologically nested tags, swap
+ * this to a DOMParser-based extraction.
  */
 function extractTag(xml: string, tag: string): string | null {
   // Match `<tag>value</tag>` allowing namespace-prefixed forms (`<x:tag>...`)
@@ -36,7 +61,7 @@ function extractTag(xml: string, tag: string): string | null {
   // tags whose content spans newlines (pretty-printed XML) are captured.
   const re = new RegExp(`<(?:[A-Za-z0-9_]+:)?${tag}(?:\\s+[^>]*)?>([\\s\\S]*?)</(?:[A-Za-z0-9_]+:)?${tag}>`);
   const m = xml.match(re);
-  return m ? m[1] : null;
+  return m ? decodeXmlEntities(m[1]) : null;
 }
 
 function buildCompleteXml(parts: MultipartPart[]): string {
@@ -318,7 +343,14 @@ export class AwsS3Provider implements IS3Provider {
     if (!res.ok) raiseError(`completeMultipart failed (${res.status}): ${xml}`);
     // S3 can return a 200 with an Error body when finalize fails after the
     // upload has been "accepted" — detect by looking for an <Error> tag.
-    if (/<Error>/.test(xml)) {
+    // Use `extractTag` so namespace-prefixed forms (`<x:Error>` from
+    // S3-compatible servers that emit qualified names) match the same way
+    // the body's `<Code>` / `<Message>` extraction below does. The previous
+    // `/<Error>/` literal-match silently skipped this branch on those
+    // bodies, returning success and letting an in-band failure propagate as
+    // a missing-ETag fault one line down — harder to diagnose than the
+    // direct `S3 error: <code> <message>` surface.
+    if (extractTag(xml, "Error") !== null) {
       const code = extractTag(xml, "Code") ?? "Unknown";
       const message = extractTag(xml, "Message") ?? "";
       raiseError(`completeMultipart S3 error: ${code} ${message}`);

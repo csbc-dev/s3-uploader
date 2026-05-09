@@ -59,7 +59,15 @@ export class S3 extends HTMLElement {
     ],
   };
   static get observedAttributes(): string[] {
-    return ["bucket", "prefix", "content-type", "multipart-threshold", "multipart-concurrency", "put-retries"];
+    // Only the attributes whose change must propagate immediately into the
+    // Core (bucket/prefix/contentType) are observed. The numeric tuning
+    // attributes (`multipart-threshold`, `multipart-concurrency`,
+    // `put-retries`) are read on-demand from their getters at upload start,
+    // so observing them would just allocate `attributeChangedCallback`
+    // invocations the runtime then no-ops on. They were previously listed
+    // here without a matching callback branch, which read as "we sync
+    // these too" — misleading for any future maintainer wiring a handler.
+    return ["bucket", "prefix", "content-type"];
   }
 
   /** Default cutoff between single PUT and multipart, in bytes. 8 MiB. */
@@ -237,7 +245,20 @@ export class S3 extends HTMLElement {
     if (!this._hasLocalError) return;
     this._hasLocalError = false;
     this._errorState = null;
-    this.dispatchEvent(new CustomEvent("s3-uploader:error", { detail: this.error, bubbles: true }));
+    // Dispatch `null` as detail rather than `this.error` (which, in remote
+    // mode, would re-read `_remoteValues.error` and could surface the
+    // remote-side error a second time — duplicating an event the bind()
+    // mirror already delivered). The semantic of this method is "this Shell
+    // is no longer the source of an error"; the only honest detail for that
+    // signal is `null`. If the remote Core still holds a non-null error
+    // value, its own `s3-uploader:error` (delivered through the bind mirror)
+    // remains the authoritative event for that state — and `this.error`
+    // continues to reflect that remote value for any consumer that polls
+    // the property after this clear. The remote-aware getter logic in
+    // `get error()` (which prefers `_remoteValues.error` once
+    // `_hasLocalError` flips to false) keeps the read side consistent
+    // without forcing this clear to re-emit the remote's signal.
+    this.dispatchEvent(new CustomEvent("s3-uploader:error", { detail: null, bubbles: true }));
   }
 
   /** @internal — visible for testing */
@@ -293,9 +314,16 @@ export class S3 extends HTMLElement {
       throw new Error("[@csbc-dev/s3-uploader] attachLocalCore() called while a remote proxy is already attached. Call disconnectedCallback / detach first.");
     }
     this._core = core;
-    if (this.bucket) this._core.bucket = this.bucket;
-    if (this.prefix) this._core.prefix = this.prefix;
-    if (this.contentType) this._core.contentType = this.contentType;
+    // Sync gating mirrors `_connectRemote`'s `hasAttribute` rule (NOT a
+    // truthy-value rule). An explicit empty-string attribute (`prefix=""`,
+    // `bucket=""`) is a legitimate way to override a Core that was
+    // pre-seeded server-side or by a previous attach — silently skipping
+    // empty strings here would let the seeded value leak through. Symmetry
+    // with the remote path also keeps `attachLocalCore` as a true drop-in
+    // alternative for tests / advanced setups.
+    if (this.hasAttribute("bucket")) this._core.bucket = this.bucket;
+    if (this.hasAttribute("prefix")) this._core.prefix = this.prefix;
+    if (this.hasAttribute("content-type")) this._core.contentType = this.contentType;
   }
 
   // --- Input attributes ---
@@ -380,7 +408,14 @@ export class S3 extends HTMLElement {
     }
     return this._requestedKey();
   }
-  set key(value: string) { this._explicitKey = value || ""; }
+  set key(value: string | null | undefined) {
+    // Accept null/undefined symmetrically with the bucket / prefix /
+    // contentType setters so callers can clear an explicit key by writing
+    // `el.key = null` rather than the somewhat surprising `el.key = ""`.
+    // Internally stores as the empty string to keep `_requestedKey()`'s
+    // truthy-test branching simple.
+    this._explicitKey = value || "";
+  }
 
   // --- Output state ---
 
@@ -549,6 +584,16 @@ export class S3 extends HTMLElement {
    * (!key || !uploadId)` guards and the bug would be silently swallowed by
    * the `.catch(() => {})` below. Spreading `...remoteArgs` preserves the
    * expected call shape.
+   *
+   * Pre-attach / pre-connect calls (no `_proxy`, no `_core`) silently no-op.
+   * The Shell only wires through `_dispatchFireAndForget` from inside its
+   * own upload pipeline (`_reportProgress`, `_abortMultipartFireAndForget`,
+   * `_abortFireAndForget`), all of which presuppose an active upload — so
+   * the only way the no-op branch is reached is from an `abort()` issued
+   * before `connectedCallback` ever ran (no upload to abort) or after
+   * `disconnectedCallback` tore down the proxy/Core. Both are valid no-op
+   * cases — there is nothing to advise — and treating them as warnings would
+   * spam the console for normal teardown.
    */
   private _dispatchFireAndForget(
     remoteName: string,
@@ -705,7 +750,12 @@ export class S3 extends HTMLElement {
         this._currentUpload = null;
       }
     };
-    promise.then(clear, clear);
+    // `void` discards the chained promise explicitly. `clear` is intentionally
+    // exception-free today (only mutates two slots), but if a future revision
+    // ever lets it throw, the discarded chain would surface as an
+    // unhandledrejection. Marking `void` documents the intentional discard
+    // and matches the lint rule we apply to other discarded promise chains.
+    void promise.then(clear, clear);
     return promise;
   }
 
@@ -812,17 +862,26 @@ export class S3 extends HTMLElement {
       // cause from the consumer. We still throw so the upload promise rejects.
       //
       // In remote mode, if the failure originated from an RPC (typically
-      // `_signMultipartPart` during a mid-stream re-sign), the server Core
-      // has already published the error via `bind()` → `_remoteValues.error`
-      // — dispatching locally on top of that produces a duplicate
-      // `s3-uploader:error` event for one logical failure. Skip the local
-      // dispatch when the remote slot is already populated; `error` getter
-      // returns the remote value so subscribers still see the failure
-      // through the already-delivered event. For local XHR failures
-      // (network error / abort on the part PUT itself), the Core has no
-      // signal, so `"error" in _remoteValues` is false and we fall through
-      // to the local dispatch exactly as before.
-      if (!this._hasLocalError && !(this._isRemote && "error" in this._remoteValues)) {
+      // `_signMultipartPart` during a mid-stream re-sign or
+      // `requestMultipartUpload` / `completeMultipart` failures that route
+      // through `_setRpcErrorState`), the server Core has already published
+      // the error via `bind()` → `_remoteValues.error` — dispatching locally
+      // on top of that produces a duplicate `s3-uploader:error` event for one
+      // logical failure. Skip the local dispatch when the remote slot has a
+      // non-null error; the `error` getter returns the remote value so
+      // subscribers still see the failure through the already-delivered
+      // event.
+      //
+      // The check is `!= null`, NOT `"error" in _remoteValues`: Core's
+      // `requestMultipartUpload` calls `_setError(null)` at the start of
+      // every run to clear prior errors, which propagates through `bind()`
+      // and populates `_remoteValues.error` with `null`. An `in` check
+      // would then suppress every dispatch — including local XHR failures
+      // the Core has no way to know about — silently swallowing the error
+      // event subscribers rely on.
+      const remoteErrorPublished = this._isRemote
+        && this._remoteValues.error != null;
+      if (!this._hasLocalError && !remoteErrorPublished) {
         this._setErrorState(err);
       }
       throw err;
@@ -1008,6 +1067,17 @@ export class S3 extends HTMLElement {
 
   connectedCallback(): void {
     this.style.display = "none";
+    // Reset the aborted flag on every connect: a prior disconnectedCallback
+    // sets `_aborted = true` to stop in-flight workers, and although
+    // `upload()` resets it again at the start of every run, leaving it
+    // sticky between disconnect and the next upload() attempt is brittle —
+    // any future code path that consults `_aborted` outside `upload()`'s
+    // own reset window (e.g. an attribute-driven side effect, a test
+    // harness, a follow-on refactor that reads it before upload starts)
+    // would observe a stale "aborted" state on a freshly reconnected
+    // element. Resetting here makes the post-connect state indistinguishable
+    // from a freshly constructed Shell.
+    this._aborted = false;
     if (_getInternalConfig().remote.enableRemote && !this._isRemote) {
       try {
         this._initRemote();
@@ -1045,6 +1115,16 @@ export class S3 extends HTMLElement {
   private static readonly _SYNC_INPUTS = ["bucket", "prefix", "contentType"] as const;
 
   private _syncInput(name: typeof S3._SYNC_INPUTS[number], value: string): void {
+    // Pre-connect / pre-upgrade attribute changes (custom-element upgrade
+    // ordering can fire `attributeChangedCallback` before
+    // `connectedCallback` instantiates the proxy or Core) are intentionally
+    // dropped here — there is no Core to sync to yet. The eventual
+    // `_connectRemote` / `attachLocalCore` path re-flushes every observed
+    // attribute via `hasAttribute(...)` reads, so the most recent attribute
+    // value is delivered exactly once when the Core actually exists. This is
+    // the contract: attribute mutations land in the Core synchronously
+    // *while connected*, and at the next connect transition *while
+    // disconnected*.
     if (this._isRemote && this._proxy) {
       this._proxy.setWithAck(name, value).catch((e: unknown) => this._setErrorState(e));
     } else if (this._core) {
@@ -1071,5 +1151,18 @@ export class S3 extends HTMLElement {
     } else if (this._core) {
       this._core.abort();
     }
+    // Drop the in-flight slot eagerly. The prior `_aborted = true` plus the
+    // XHR / RPC cancellation above will eventually let the original promise
+    // settle and our normal `.then(clear, clear)` chain would then null
+    // `_currentUpload` — but that resolution is asynchronous, so a quick
+    // disconnect → reconnect → upload() round-trip can land before it
+    // completes and observe the still-settling promise as "in flight",
+    // returning the aborted promise instead of starting a fresh run.
+    // Bumping the generation makes the still-pending `clear` callback
+    // recognise itself as stale and skip touching the slot, so a freshly
+    // started upload after reconnect cannot be clobbered by the prior
+    // upload's late settlement.
+    this._uploadGeneration++;
+    this._currentUpload = null;
   }
 }

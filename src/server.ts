@@ -17,7 +17,7 @@
 export { S3Core } from "./core/S3Core.js";
 export { AwsS3Provider } from "./providers/AwsS3Provider.js";
 export type { AwsS3ProviderOptions } from "./providers/AwsS3Provider.js";
-export { presignS3Url } from "./signing/sigv4.js";
+export { presignS3Url, SkewError } from "./signing/sigv4.js";
 export type {
   SigV4Credentials, SigV4PresignParams, SigV4PresignResult,
 } from "./signing/sigv4.js";
@@ -26,6 +26,7 @@ export type { RetryOptions, S3OwnedError } from "./retry.js";
 export type {
   IS3Provider, S3RequestOptions, PresignedUpload, PresignedDownload,
   S3ObjectMetadata, S3Progress, PostProcessHook, PostProcessContext,
-  PostProcessOptions, S3Error, MultipartInit, MultipartPartUrl, MultipartPart,
+  PostProcessOptions, S3Error, SerializedError, WcsS3AnyError,
+  MultipartInit, MultipartPartUrl, MultipartPart,
   WcsS3CoreValues,
 } from "./types.js";

@@ -228,6 +228,15 @@ export class S3Core extends EventTarget {
    * telemetry) whose failure must not invalidate the upload — non-fatal
    * throws emit a `s3-uploader:postprocess-warning` event on the Core's target
    * and the chain continues with the next hook.
+   *
+   * Duplicate registrations of the same hook function are intentionally
+   * permitted. Each call returns its own disposer that splices out only that
+   * specific entry, and the same function may legitimately want to be
+   * registered twice with different `fatal` flags (e.g. once as a fatal
+   * gate, once as a non-fatal observer for a different observability lane).
+   * Callers that want "register-once" semantics must dedupe at their own
+   * call site — comparing function identity inside this method would also
+   * silently break the disposer-per-call contract.
    */
   registerPostProcess(hook: PostProcessHook, options: PostProcessOptions = {}): () => void {
     if (typeof hook !== "function") raiseError("hook must be a function.");
@@ -292,6 +301,20 @@ export class S3Core extends EventTarget {
     // remote and local consumers see identical structure.
     const normalised = normaliseError(err);
 
+    // Idempotent no-op when the error slot is already null and the caller
+    // is clearing it again. Every `request*` / `deleteObject` entry calls
+    // `_setError(null)` to discard a prior failure before the new attempt;
+    // without this guard, a normal start-of-upload sequence dispatches a
+    // spurious `s3-uploader:error` (detail=null) on every run, forcing
+    // every consumer to filter null detail values explicitly. Comparing
+    // both sides on `null` keeps the guard narrow — non-null clears (e.g.
+    // `_setError(undefined)` if a future caller writes that) still flow
+    // through normalisation. Skipping only the null→null transition also
+    // preserves the Shell's `_remoteValues.error != null` check, which
+    // already collapses "Core published null" and "Core never published"
+    // into the same branch.
+    if (normalised === null && this._error === null) return;
+
     // Attach a non-enumerable `toJSON` so that `JSON.stringify(core.error)`
     // produces a serialisable payload (Error instances would otherwise become
     // `{}`). Using `defineProperty` with `enumerable: false` avoids altering
@@ -302,6 +325,7 @@ export class S3Core extends EventTarget {
     // stamped — this method is re-entrant for the same error across multiple
     // dispatch paths). Plain `SerializedError` payloads are already
     // JSON-safe, so the monkey-patch only applies to real Error instances.
+    let payload: WcsS3AnyError = normalised;
     if (
       normalised instanceof Error
       && !Object.prototype.hasOwnProperty.call(normalised, "toJSON")
@@ -318,14 +342,42 @@ export class S3Core extends EventTarget {
           configurable: true,
           writable: true,
         });
-      } catch {
+      } catch (defineErr) {
         // Frozen / sealed errors (exotic error classes, cross-realm errors)
-        // cannot have properties defined on them; swallow and ship the raw
-        // error through — consumers will just see the default serialisation.
+        // cannot have properties defined on them. Without a toJSON, the
+        // remote serialiser would emit `{}` (Error's own enumerable
+        // own-properties are empty) and the wire payload would be a
+        // useless empty object even though a real error fired.
+        //
+        // Substitute a plain SerializedError-shaped clone in the
+        // *dispatched detail* only — `this._error` keeps the original
+        // Error reference so local-mode `instanceof Error` checks on the
+        // getter still pass. This narrows the discrepancy to
+        // exactly the listeners that observe `event.detail`, which is
+        // also the path that hits the JSON serialiser remotely.
+        //
+        // Warn once via console so operators get a single signal that the
+        // monkey-patch fell back. We deliberately do not throw — the
+        // upload already failed, surfacing a second error here would
+        // double-dispatch. Guard the warn so a console-less environment
+        // (some runtimes wipe console for sandboxing) does not turn the
+        // fallback into its own crash.
+        if (typeof console !== "undefined" && typeof console.warn === "function") {
+          console.warn(
+            "[@csbc-dev/s3-uploader] could not attach toJSON to error (frozen/sealed); " +
+            "dispatching SerializedError shape instead.",
+            defineErr,
+          );
+        }
+        payload = {
+          name: normalised.name,
+          message: normalised.message,
+          ...(normalised.stack ? { stack: normalised.stack } : {}),
+        };
       }
     }
     this._error = normalised;
-    this._target.dispatchEvent(new CustomEvent("s3-uploader:error", { detail: this._error, bubbles: true }));
+    this._target.dispatchEvent(new CustomEvent("s3-uploader:error", { detail: payload, bubbles: true }));
   }
 
   // --- rAF batching for progress events ---
@@ -417,18 +469,45 @@ export class S3Core extends EventTarget {
     const mp = this._multipart;
     if (!mp) return;
     this._multipart = null;
-    this._provider.abortMultipart(mp.key, mp.uploadId, mp.options)
+    this._fireAndForgetAbortMultipart(
+      mp.key, mp.uploadId, mp.options, "prior-multipart",
+    );
+  }
+
+  /**
+   * Fire-and-forget abortMultipart that surfaces failures via the
+   * `s3-uploader:abort-cleanup-warning` event channel rather than swallowing
+   * them silently. Centralising this here means every "best-effort cleanup"
+   * call site shares the same observability contract — without it, a
+   * `.catch(() => {})` on one path and a structured warning on another would
+   * leave operators blind to half the orphan-parts surface area.
+   *
+   * `reason` distinguishes the call site in the dispatched event detail
+   * (`prior-multipart`, `presign-superseded`, `presign-failure`,
+   * `complete-failure`, `abort`).
+   */
+  private _fireAndForgetAbortMultipart(
+    key: string,
+    uploadId: string,
+    options: S3RequestOptions,
+    reason: string,
+  ): void {
+    this._provider.abortMultipart(key, uploadId, options)
       .catch((error: unknown) => {
-        // Best-effort: surface via the same warning channel as the explicit
-        // `abort()` path so ops are not blind to orphan cleanup failures.
         this._target.dispatchEvent(new CustomEvent("s3-uploader:abort-cleanup-warning", {
           detail: {
-            error,
+            // Same wire-survivability projection as
+            // `s3-uploader:postprocess-warning`: a raw `Error` would JSON-stringify
+            // to `{}`, leaving remote ops with no signal beyond "cleanup failed
+            // for some unknown reason". `_serialiseWarningError` keeps local
+            // `instanceof Error` consumers happy and gives wire consumers the
+            // populated `{ name, message, stack? }` shape.
+            error: this._serialiseWarningError(error),
             ctx: {
-              bucket: mp.options.bucket,
-              key: mp.key,
-              uploadId: mp.uploadId,
-              reason: "prior-multipart",
+              bucket: options.bucket,
+              key,
+              uploadId,
+              reason,
             },
           },
           bubbles: true,
@@ -448,6 +527,18 @@ export class S3Core extends EventTarget {
     if (size !== undefined && (!Number.isFinite(size) || size < 0)) {
       raiseError(`size must be a non-negative number, got ${size}.`);
     }
+    // Resolve request options BEFORE mutating any observable state. Otherwise a
+    // missing-bucket sync throw from `_baseRequestOptions()` would leave the
+    // element in `loading=true` with stale key/metadata/progress published —
+    // any consumer that observed the loading transition has no signal that the
+    // operation never actually started, because the throw is surfaced only via
+    // the awaiting caller's catch (and `_setError` was never reached). Doing
+    // the validation first means a misconfigured-bucket path produces zero
+    // observable state mutations, matching the "fail before any side effect"
+    // contract every other early validation in this method already follows.
+    const opts = this._baseRequestOptions({
+      contentType: contentType || this._contentType || undefined,
+    });
     // Cancel any leftover multipart from a previous request before bumping
     // the generation — otherwise the orphan uploadId becomes unreachable.
     this._abortPriorMultipart();
@@ -472,10 +563,6 @@ export class S3Core extends EventTarget {
     this._setKey(key);
     this._setMetadata({ size, contentType: contentType || this._contentType || undefined });
     this._setProgress({ loaded: 0, total: size ?? 0, phase: "signing" });
-
-    const opts = this._baseRequestOptions({
-      contentType: contentType || this._contentType || undefined,
-    });
     try {
       const presigned = await this._provider.presignUpload(key, opts);
       // Superseded by a newer request while we awaited the presign. Bail
@@ -530,18 +617,74 @@ export class S3Core extends EventTarget {
    * been detected). Extracted so both finalizers share one implementation.
    */
   private async _runPostProcessHooks(ctx: PostProcessContext, gen: number): Promise<boolean> {
-    for (const entry of this._postProcessHooks) {
+    // Snapshot the hook list before iterating. A hook can legitimately mutate
+    // `_postProcessHooks` mid-chain — its own disposer (returned by
+    // `registerPostProcess`) splices the entry out, and a hook may also
+    // register a follow-on hook for the next upload. Iterating the live
+    // array would then either skip the next entry (after a splice shifts
+    // indices down) or re-order the chain unpredictably. The shallow copy
+    // freezes the chain's membership for THIS invocation while leaving
+    // disposers / new registrations correctly applied to subsequent runs.
+    const hooks = [...this._postProcessHooks];
+    for (const entry of hooks) {
       try {
         await entry.hook(ctx);
       } catch (e: unknown) {
         if (entry.fatal) throw e;
+        // Project the thrown value through the same normaliser the error slot
+        // uses, so consumers that observe `s3-uploader:postprocess-warning` over
+        // the wire (where `JSON.stringify(Error)` collapses to `{}`) receive a
+        // populated `{ name, message, stack? }` shape instead of an empty
+        // object. Local subscribers see an `Error` instance unchanged.
         this._target.dispatchEvent(new CustomEvent("s3-uploader:postprocess-warning", {
-          detail: { error: e, ctx },
+          detail: { error: this._serialiseWarningError(e), ctx },
           bubbles: true,
         }));
       }
     }
     return gen === this._generation;
+  }
+
+  /**
+   * Project a thrown value into a JSON-safe shape for the warning event channels
+   * (`s3-uploader:postprocess-warning`, `s3-uploader:abort-cleanup-warning`). These
+   * detail payloads cross the WebSocket via the wc-bindable remote transport,
+   * where `JSON.stringify(Error)` collapses an `Error` instance to `{}` because
+   * the standard fields are non-enumerable. Mirroring `_setError`'s monkey-patch
+   * approach — define a non-enumerable `toJSON` on the original error so local
+   * `instanceof Error` consumers still see the live reference, while remote
+   * consumers see `{ name, message, stack? }`. Falls back to the same plain-
+   * object serialisation `_setError` uses when the error is frozen / sealed and
+   * `defineProperty` rejects, so no consumer ever sees `{}` for a real failure.
+   */
+  private _serialiseWarningError(err: unknown): unknown {
+    const normalised = normaliseError(err);
+    if (
+      normalised instanceof Error
+      && !Object.prototype.hasOwnProperty.call(normalised, "toJSON")
+      && typeof (normalised as { toJSON?: unknown }).toJSON !== "function"
+    ) {
+      try {
+        Object.defineProperty(normalised, "toJSON", {
+          value: () => ({
+            name: normalised.name,
+            message: normalised.message,
+            ...(normalised.stack ? { stack: normalised.stack } : {}),
+          }),
+          enumerable: false,
+          configurable: true,
+          writable: true,
+        });
+        return normalised;
+      } catch {
+        return {
+          name: normalised.name,
+          message: normalised.message,
+          ...(normalised.stack ? { stack: normalised.stack } : {}),
+        };
+      }
+    }
+    return normalised;
   }
 
   /**
@@ -776,29 +919,15 @@ export class S3Core extends EventTarget {
       // have already mutated `this.bucket`/`this.prefix` since init.
       //
       // Surface cleanup failures via `s3-uploader:abort-cleanup-warning` instead
-      // of the old `.catch(() => {})` silent swallow. `abort()` is itself
-      // sync-returning (the wc-bindable command is non-async) so we cannot
-      // reject the caller's promise, but ops still need a signal that the
-      // orphan parts were not reclaimed — otherwise S3 keeps billing for
-      // them and the only evidence is a storage-report anomaly days later.
-      // The event mirrors the `s3-uploader:postprocess-warning` pattern used
-      // elsewhere in Core: non-fatal, structured `{ error, ctx }` detail,
-      // bubbles so host pages can install a single top-level listener.
-      this._provider.abortMultipart(mp.key, mp.uploadId, mp.options)
-        .catch((error: unknown) => {
-          this._target.dispatchEvent(new CustomEvent("s3-uploader:abort-cleanup-warning", {
-            detail: {
-              error,
-              ctx: {
-                bucket: mp.options.bucket,
-                key: mp.key,
-                uploadId: mp.uploadId,
-                reason: "abort",
-              },
-            },
-            bubbles: true,
-          }));
-        });
+      // of a silent swallow. `abort()` is itself sync-returning (the
+      // wc-bindable command is non-async) so we cannot reject the caller's
+      // promise, but ops still need a signal that the orphan parts were not
+      // reclaimed — otherwise S3 keeps billing for them and the only evidence
+      // is a storage-report anomaly days later. The event mirrors the
+      // `s3-uploader:postprocess-warning` pattern used elsewhere in Core:
+      // non-fatal, structured `{ error, ctx }` detail, bubbles so host pages
+      // can install a single top-level listener.
+      this._fireAndForgetAbortMultipart(mp.key, mp.uploadId, mp.options, "abort");
     }
   }
 
@@ -820,6 +949,13 @@ export class S3Core extends EventTarget {
   ): Promise<MultipartInit> {
     if (!key) raiseError("key is required.");
     if (!Number.isFinite(size) || size <= 0) raiseError(`size must be a positive number, got ${size}.`);
+    // Resolve request options BEFORE mutating observable state, mirroring
+    // `requestUpload`. A missing-bucket sync throw from `_baseRequestOptions()`
+    // here would otherwise leave `loading=true` published with key / metadata
+    // / progress already mutated, even though no presign was ever attempted.
+    const opts = this._baseRequestOptions({
+      contentType: contentType || this._contentType || undefined,
+    });
     // Same prior-multipart cleanup as requestUpload.
     this._abortPriorMultipart();
     // And drop any stale single-PUT snapshot — we are switching upload modes.
@@ -834,10 +970,6 @@ export class S3Core extends EventTarget {
     this._setKey(key);
     this._setMetadata({ size, contentType: contentType || this._contentType || undefined });
     this._setProgress({ loaded: 0, total: size, phase: "signing" });
-
-    const opts = this._baseRequestOptions({
-      contentType: contentType || this._contentType || undefined,
-    });
     const effectivePartSize = computePartSize(size, partSize);
     const partCount = Math.ceil(size / effectivePartSize);
     if (partCount > S3_MAX_PARTS) {
@@ -861,9 +993,10 @@ export class S3Core extends EventTarget {
     }
 
     // A newer requestUpload may have superseded us mid-init. Best-effort clean
-    // up the orphaned multipart so we do not leak storage.
+    // up the orphaned multipart so we do not leak storage; surface failures
+    // through the shared abort-cleanup-warning channel so ops are not blind.
     if (gen !== this._generation) {
-      this._provider.abortMultipart(key, uploadId, opts).catch(() => {});
+      this._fireAndForgetAbortMultipart(key, uploadId, opts, "presign-superseded");
       throw new Error("[@csbc-dev/s3-uploader] requestMultipartUpload superseded.");
     }
 
@@ -907,8 +1040,9 @@ export class S3Core extends EventTarget {
         });
       }
     } catch (e: unknown) {
-      // Roll back the just-initiated multipart so we do not leak.
-      this._provider.abortMultipart(key, uploadId, opts).catch(() => {});
+      // Roll back the just-initiated multipart so we do not leak. Surface
+      // cleanup failures via the shared abort-cleanup-warning channel.
+      this._fireAndForgetAbortMultipart(key, uploadId, opts, "presign-failure");
       if (gen === this._generation) {
         this._setError(e);
         this._setLoading(false);
@@ -1021,7 +1155,10 @@ export class S3Core extends EventTarget {
         ({ etag } = await this._provider.completeMultipart(key, uploadId, parts, mpOptions));
       } catch (e: unknown) {
         // Best-effort: if S3 rejected the merge, abort to free the parts.
-        this._provider.abortMultipart(key, uploadId, mpOptions).catch(() => {});
+        // Cleanup failures surface via the shared abort-cleanup-warning
+        // channel so a "merge fail + cleanup fail" double-failure is visible
+        // to ops rather than silently swallowed.
+        this._fireAndForgetAbortMultipart(key, uploadId, mpOptions, "complete-failure");
         throw e;
       }
       if (etag) this._setEtag(etag);

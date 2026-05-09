@@ -58,11 +58,26 @@ export class S3Callback extends HTMLElement {
     // Walk up the DOM looking for an instance of the configured host tag.
     // Reading config here (rather than at module load) means a `setConfig`
     // call before bootstrapS3() takes effect even on already-defined classes.
+    //
+    // Cross ShadowRoot boundaries via `host` so a `<s3-callback>` placed
+    // inside a Shadow DOM can still find an `<s3-uploader>` ancestor in the
+    // host tree. `parentNode` is null at the ShadowRoot, which would
+    // otherwise terminate the walk silently — the callback would attach
+    // to nothing and the developer sees no error, just events that never
+    // fire. The `for` attribute is the documented escape hatch when crossing
+    // shadow boundaries needs an explicit selector; this fallback covers
+    // the common case where the host is in the parent tree directly.
     const hostTag = _getInternalConfig().tagNames.s3.toLowerCase();
     let node: Node | null = this.parentNode;
     while (node) {
       if (node instanceof HTMLElement && node.tagName.toLowerCase() === hostTag) {
         return node;
+      }
+      // ShadowRoot has parentNode === null. Cross to the shadow host so the
+      // walk continues in the light tree above the shadow boundary.
+      if (typeof ShadowRoot !== "undefined" && node instanceof ShadowRoot) {
+        node = node.host;
+        continue;
       }
       node = node.parentNode;
     }
@@ -208,6 +223,17 @@ export class S3Callback extends HTMLElement {
     this._eventName = eventName;
     const handler = (e: Event) => {
       const fn = this._fn;
+      // Silent drop when `_fn` is not yet loaded. `_attach()` can run from
+      // `attributeChangedCallback` (on `on` / `for` changes) BEFORE the
+      // initial `_loadModule()` has resolved the user-authored module —
+      // any host event that fires in that window has nowhere to go. We
+      // deliberately do not queue the event: the user's callback is
+      // expected to be synchronous w.r.t. the event tick (e.g. a render
+      // update), and replaying a stale `progress` after `completed` has
+      // landed would corrupt the consumer's state. Module load is fast in
+      // practice (Blob URL + dynamic import) and the documented contract
+      // is "the callback fires for events emitted after the element is
+      // ready" — see README's `<s3-callback>` section.
       if (!fn) return;
       const detail = (e as CustomEvent).detail;
       try {

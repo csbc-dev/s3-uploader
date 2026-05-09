@@ -33,7 +33,6 @@ export interface IWritableConfig {
 export interface IWcBindableProperty {
   readonly name: string;
   readonly event: string;
-  readonly getter?: (event: Event) => any;
 }
 
 export interface IWcBindableInput {

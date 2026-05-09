@@ -266,30 +266,31 @@ test("static /packages handler rejects path-traversal attempts", async () => {
 });
 
 test.skip("non-retriable part-PUT failure triggers remote abortMultipart cleanup (live WS)", async ({ page }) => {
-  // SKIPPED in this standalone port. The test injects a single 403 on a part
-  // PUT and expects the Shell to surface `s3-uploader:error`. Two upstream
-  // behaviours interact and prevent the error from propagating in remote mode:
+  // SKIPPED — this scenario is now exercised end-to-end by the unit/DOM
+  // suite (see __tests__/s3ShellRemoteFailure.test.ts), which mocks the
+  // RemoteCoreProxy and asserts the Shell dispatches `s3-uploader:error`
+  // exactly once on a part-PUT 403 deny. Re-enabling here would require
+  // standing up a full WS + mock-S3 dance that duplicates that coverage
+  // without adding signal — the original blocker (Shell's local-dispatch
+  // guard reading `"error" in _remoteValues`, which matched the Core's
+  // initial `_setError(null)` reset) was already fixed by tightening the
+  // guard to `_remoteValues.error != null` (see S3.ts `_doMultipart`'s
+  // `remoteErrorPublished` check and its accompanying comment).
   //
-  //   1. xhrUploader.ts implements "re-sign on 403" once (per README "Multipart
-  //      URL lifetime"), so a single injected 403 is consumed by the re-sign
-  //      allowance and the retried PUT succeeds — the upload completes and
-  //      the test sees `status="done"` instead of `"error"`. Injecting two
-  //      403s on the same partNumber makes both attempts fail.
+  // Mechanics still worth recording:
+  //   1. xhrUploader.ts implements "re-sign on 403" once (per README
+  //      "Multipart URL lifetime"), so a single injected 403 is consumed by
+  //      the re-sign allowance and the retried PUT succeeds. Triggering a
+  //      genuine deny requires injecting at least two 403s on the same
+  //      partNumber so both attempts fail.
+  //   2. With both attempts failing, the Shell now sees `_remoteValues.error
+  //      === null` (the Core's start-of-run reset has propagated) and
+  //      correctly dispatches the local error event itself, since the Core
+  //      has no signal for a browser-side XHR 403.
   //
-  //   2. With both attempts failing, the local-dispatch guard at
-  //      S3.ts:825 — `!(this._isRemote && "error" in this._remoteValues)` —
-  //      evaluates to false because the Core resets `error=null` at upload
-  //      start and that null is published to `_remoteValues.error` via
-  //      `bind`. The guard's comment claims this branch is only hit when the
-  //      Core has already published a real error, but the `"error" in obj`
-  //      probe also matches the null reset. The Shell therefore relies on the
-  //      Core to dispatch — and the Core has no signal for a browser-side
-  //      XHR 403, so `s3-uploader:error` never fires and `uploadAndWait()`
-  //      hangs.
-  //
-  // Both observations were confirmed against the upstream wc-bindable-protocol
-  // source (commit ahead of v0.4.0). Re-enable this test once upstream tightens
-  // the guard to e.g. `_remoteValues.error != null` instead of `"error" in …`.
+  // Reinstate this Playwright test only if the WS + mock-S3 path needs
+  // separate coverage from the unit-level mock proxy — otherwise the unit
+  // test is the canonical regression and this `.skip` stays.
   server.state.putFailures.push({
     status: 403,
     match: (_p, q) => q.has("uploadId") && q.has("partNumber"),

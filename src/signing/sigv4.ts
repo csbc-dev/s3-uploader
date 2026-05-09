@@ -222,6 +222,18 @@ function buildHost(bucket: string, region: string, endpoint: string | undefined,
   return { host: `${bucket}.s3.${region}.amazonaws.com`, pathPrefix: "", protocol: "https:" };
 }
 
+/**
+ * Build a SigV4 canonical query string. Both keys and values MUST be strings
+ * — the `Record<string, string>` type is the contract, not a hint. Internal
+ * callers (`presignS3Url`) build `params` from already-stringified inputs
+ * (`String(partNumber)`, `uploadId`, `extraQuery` from typed sites), so the
+ * contract is upheld by construction. We deliberately do NOT add a runtime
+ * `typeof` guard here: any caller that bypasses TS to pass non-string values
+ * (e.g. `as any`) is already opting out of safety, and an exception thrown
+ * deep inside SigV4 signing — after the URL skeleton is built but before the
+ * signature is computed — produces a worse failure surface than the
+ * stringification semantics they implicitly accept.
+ */
 function canonicalQuery(params: Record<string, string>): string {
   const keys = Object.keys(params).sort();
   return keys
@@ -244,12 +256,17 @@ export async function presignS3Url(
   // 2^31 to negative numbers — `Math.max(1, ...)` then hides the wrap by
   // clamping to 1 second, producing a presigned URL that expires almost
   // immediately. Caller gets no signal that the lifetime they asked for was
-  // discarded. Reject non-finite values and values above the S3 ceiling
-  // loudly instead; truncate with `Math.trunc` for floats so the subsequent
-  // arithmetic stays integer-valued.
+  // discarded. Reject non-finite values, non-positive values, and values
+  // above the S3 ceiling loudly instead; truncate with `Math.trunc` for
+  // floats so the subsequent arithmetic stays integer-valued. The
+  // `Math.max(1, ...)` below is retained as a defensive floor in case future
+  // refactors reintroduce a signed-int coercion path.
   const rawExpires = params.expiresInSeconds;
   if (!Number.isFinite(rawExpires)) {
     throw new Error(`[@csbc-dev/s3-uploader] expiresInSeconds must be a finite number, got ${rawExpires}.`);
+  }
+  if (rawExpires <= 0) {
+    throw new Error(`[@csbc-dev/s3-uploader] expiresInSeconds must be a positive number, got ${rawExpires}.`);
   }
   if (rawExpires > 604800) {
     throw new Error(`[@csbc-dev/s3-uploader] expiresInSeconds exceeds AWS limit of 604800 (7 days), got ${rawExpires}.`);

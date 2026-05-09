@@ -154,4 +154,25 @@ describe("AwsS3Provider multipart", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse("", 200));
     await expect(newProvider().abortMultipart("k", "U", { bucket: "b" })).resolves.toBeUndefined();
   });
+
+  it("extractTag decodes XML predefined entities in error Code/Message", async () => {
+    // S3-compatible servers can entity-escape user-controlled fields
+    // embedded in <Code>/<Message>/<Resource> bodies. Without the entity
+    // decoder, the raw `&amp;` / `&lt;` text leaks through to the thrown
+    // Error message — confusing log readers and breaking pattern matchers
+    // that expect decoded characters. We round-trip a body that escapes the
+    // five XML predefined entities plus a numeric character reference
+    // (`&#x41;` → "A") and assert the thrown message carries the decoded
+    // form. completeMultipart raises with `Code` + ` ` + `Message`, so both
+    // tags get exercised in one call.
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(mockResponse(
+      `<Error>
+         <Code>Some&amp;Code</Code>
+         <Message>Path &lt;abc&gt; &quot;denied&quot; for user&apos;s key &#x41;</Message>
+       </Error>`
+    ));
+    await expect(
+      newProvider().completeMultipart("k", "U", [{ partNumber: 1, etag: "a" }], { bucket: "b" }),
+    ).rejects.toThrow(/Some&Code Path <abc> "denied" for user's key A/);
+  });
 });

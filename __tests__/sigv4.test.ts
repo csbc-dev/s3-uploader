@@ -192,6 +192,33 @@ describe("presignS3Url (SigV4)", () => {
     })).rejects.toThrow(/finite/);
   });
 
+  it("rejects negative expiry values loudly", async () => {
+    // Without an explicit guard, `Math.max(1, Math.trunc(rawExpires))` would
+    // silently clamp negative inputs to 1 second, producing a URL that
+    // expires almost immediately and giving the caller no signal that their
+    // lifetime was discarded. Stay consistent with the other input
+    // validations (empty creds/region/bucket/key, > 604800, NaN) and reject.
+    await expect(presignS3Url(awsExample, {
+      method: "GET",
+      region: "us-east-1",
+      bucket: "b",
+      key: "k",
+      now: 0,
+      expiresInSeconds: -100,
+    })).rejects.toThrow(/positive/);
+  });
+
+  it("rejects zero expiry loudly", async () => {
+    await expect(presignS3Url(awsExample, {
+      method: "GET",
+      region: "us-east-1",
+      bucket: "b",
+      key: "k",
+      now: 0,
+      expiresInSeconds: 0,
+    })).rejects.toThrow(/positive/);
+  });
+
   it("floors fractional expiry values", async () => {
     // Prior behaviour used `| 0` which both truncates AND wraps at 2^31.
     // `Math.trunc` keeps the truncation semantics for fractional values so
