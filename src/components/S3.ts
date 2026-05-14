@@ -503,6 +503,10 @@ export class S3 extends HTMLElement {
    * event pair. If you need "cancel the in-flight upload and start a new
    * one", call `abort()` + `upload()` explicitly (see `upload()`'s JSDoc
    * for the correct sequence); `trigger` does not offer that escape hatch.
+   *
+   * When `trigger=true` is set with no `file` selected, `trigger` briefly
+   * flips true→false as the no-op `upload()` rejects; the failure is reported
+   * only via the `s3-uploader:error` event, not by `trigger` staying high.
    */
   set trigger(value: boolean) {
     const v = !!value;

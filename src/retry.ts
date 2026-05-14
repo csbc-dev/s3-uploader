@@ -28,7 +28,13 @@ export async function retryWithBackoff<T>(
   fn: (attempt: number) => Promise<T>,
   opts: RetryOptions,
 ): Promise<T> {
-  const max = Math.max(0, opts.maxRetries | 0);
+  // `opts.maxRetries | 0` is a signed-int32 coercion that silently wraps
+  // values >= 2^31 to negative numbers (and NaN/Infinity to 0). `Math.trunc`
+  // + a finiteness guard matches the defensive shape sigv4.ts uses for
+  // `expiresInSeconds` — a non-finite or absurd retry count clamps to 0
+  // rather than wrapping into a nonsense bound.
+  const rawMax = opts.maxRetries;
+  const max = Number.isFinite(rawMax) ? Math.max(0, Math.trunc(rawMax)) : 0;
   const base = opts.baseDelayMs ?? 250;
   const cap = opts.maxDelayMs ?? 4000;
   const sleep = opts.sleep ?? defaultSleep;

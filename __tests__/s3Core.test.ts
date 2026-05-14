@@ -383,6 +383,68 @@ describe("S3Core", () => {
     expect(core.key).toBe("foo.txt");
   });
 
+  it("a failed requestDownload does not clobber a concurrent upload's error generation", async () => {
+    // Regression guard: `requestDownload` is a legal command to run while an
+    // upload is in flight. Its `presignDownload` failure path must be guarded
+    // by the same generation check every other command uses — otherwise a
+    // failed download presign calls `_setError` and fires `s3-uploader:error`
+    // against the active upload's generation, even though the upload itself is
+    // fine.
+    let releaseDownload: () => void = () => {};
+    const downloadGate = new Promise<void>(r => { releaseDownload = r; });
+    provider.presignDownload = async () => {
+      await downloadGate;
+      throw new Error("download presign boom");
+    };
+
+    // Start a download against the (currently idle) core, then start a fresh
+    // upload that bumps the generation while the download presign is stalled.
+    const errorEvents: unknown[] = [];
+    core.addEventListener("s3-uploader:error", (e) => {
+      errorEvents.push((e as CustomEvent).detail);
+    });
+    const download = core.requestDownload("download.bin");
+    await core.requestUpload("upload.bin", 10);
+    // Now let the stalled download presign reject. It belongs to the prior
+    // generation, so it must NOT touch `_error` or emit `s3-uploader:error`.
+    releaseDownload();
+    await expect(download).rejects.toThrow("download presign boom");
+
+    expect(core.error).toBeNull();
+    expect(errorEvents).toEqual([]);
+  });
+
+  it("a failed deleteObject does not clobber a concurrent upload's error generation", async () => {
+    // Regression guard, symmetric with the requestDownload case above:
+    // `deleteObject` is a legal command to run mid-upload (different key, or
+    // same key after an explicit abort). Its `deleteObject` provider failure
+    // must be generation-guarded — otherwise a failed delete's `_setError(e)`
+    // overwrites the in-flight upload's `_error` and spuriously fires
+    // `s3-uploader:error` against that upload's generation.
+    let releaseDelete: () => void = () => {};
+    const deleteGate = new Promise<void>(r => { releaseDelete = r; });
+    provider.deleteObject = async () => {
+      await deleteGate;
+      throw new Error("delete boom");
+    };
+
+    const errorEvents: unknown[] = [];
+    core.addEventListener("s3-uploader:error", (e) => {
+      errorEvents.push((e as CustomEvent).detail);
+    });
+    // Start a delete against the (currently idle) core, then start a fresh
+    // upload that bumps the generation while the delete is stalled.
+    const del = core.deleteObject("stale.bin");
+    await core.requestUpload("upload.bin", 10);
+    // Let the stalled delete reject. It belongs to the prior generation, so
+    // it must NOT touch `_error` or emit `s3-uploader:error`.
+    releaseDelete();
+    await expect(del).rejects.toThrow("delete boom");
+
+    expect(core.error).toBeNull();
+    expect(errorEvents).toEqual([]);
+  });
+
   it("deleteObject clears state for the matching key", async () => {
     await core.requestUpload("k", 5);
     await core.complete("k", "e");

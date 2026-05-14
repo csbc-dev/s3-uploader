@@ -183,6 +183,12 @@ export class AwsS3Provider implements IS3Provider {
     if (!key) raiseError("key is required.");
     const p = prefix ? prefix.replace(/^\/+|\/+$/g, "") : "";
     const k = key.replace(/^\/+/, "");
+    // `key` may be non-empty yet normalise to "" (e.g. "/" or "///"). The
+    // caller's `if (!key)` guard does not catch that, and the result would
+    // be a trailing-slash object key ("prefix/") or the empty string — both
+    // address a "directory" placeholder rather than an object and would have
+    // S3 reject the PUT with an opaque error.
+    if (!k) raiseError("key must not be empty after stripping leading slashes.");
     return p ? `${p}/${k}` : k;
   }
 
@@ -238,15 +244,17 @@ export class AwsS3Provider implements IS3Provider {
     });
     const { init, cleanup } = this._withTimeout({ method: "DELETE" });
     let res: Response;
+    let errBody = "";
     try {
       res = await globalThis.fetch(result.url, init);
+      // Read the error body inside the timeout scope: `cleanup()` clears the
+      // abort timer, so a body read left until after `finally` would hang
+      // unprotected if S3 stalls mid-body.
+      if (!res.ok) errBody = await res.text().catch(() => "");
     } finally {
       cleanup();
     }
-    if (!res.ok && res.status !== 204) {
-      const body = await res.text().catch(() => "");
-      raiseError(`delete failed (${res.status}): ${body}`);
-    }
+    if (!res.ok) raiseError(`delete failed (${res.status}): ${errBody}`);
   }
 
   // --- Multipart upload ---
@@ -270,16 +278,17 @@ export class AwsS3Provider implements IS3Provider {
     if (opts.contentType) headers["Content-Type"] = opts.contentType;
     const { init, cleanup } = this._withTimeout({ method: "POST", headers });
     let res: Response;
+    let xml: string;
     try {
       res = await globalThis.fetch(presigned.url, init);
+      // Read the body inside the timeout scope — `cleanup()` clears the abort
+      // timer, so a body read left until after `finally` would hang
+      // unprotected if S3 stalls after the headers arrive.
+      xml = await res.text();
     } finally {
       cleanup();
     }
-    if (!res.ok) {
-      const body = await res.text().catch(() => "");
-      raiseError(`initiateMultipart failed (${res.status}): ${body}`);
-    }
-    const xml = await res.text();
+    if (!res.ok) raiseError(`initiateMultipart failed (${res.status}): ${xml}`);
     const uploadId = extractTag(xml, "UploadId");
     if (!uploadId) raiseError(`initiateMultipart returned no UploadId: ${xml}`);
     return { uploadId };
@@ -334,12 +343,16 @@ export class AwsS3Provider implements IS3Provider {
       body,
     });
     let res: Response;
+    let xml: string;
     try {
       res = await globalThis.fetch(presigned.url, init);
+      // Read the body inside the timeout scope — `cleanup()` clears the abort
+      // timer, so a body read left until after `finally` would hang
+      // unprotected if S3 stalls after the headers arrive.
+      xml = await res.text();
     } finally {
       cleanup();
     }
-    const xml = await res.text();
     if (!res.ok) raiseError(`completeMultipart failed (${res.status}): ${xml}`);
     // S3 can return a 200 with an Error body when finalize fails after the
     // upload has been "accepted" — detect by looking for an <Error> tag.
@@ -385,17 +398,21 @@ export class AwsS3Provider implements IS3Provider {
     });
     const { init, cleanup } = this._withTimeout({ method: "DELETE" });
     let res: Response;
+    let errBody = "";
     try {
       res = await globalThis.fetch(presigned.url, init);
+      // S3 returns 204 on success; 404 means it was already aborted/expired —
+      // treat as success so callers can safely "abort to clean up" without
+      // worrying about races with auto-expiration.
+      // Read the error body inside the timeout scope: `cleanup()` clears the
+      // abort timer, so a body read left until after `finally` would hang
+      // unprotected if S3 stalls mid-body.
+      if (!res.ok && res.status !== 404) errBody = await res.text().catch(() => "");
     } finally {
       cleanup();
     }
-    // S3 returns 204 on success; 404 means it was already aborted/expired —
-    // treat as success so callers can safely "abort to clean up" without
-    // worrying about races with auto-expiration.
-    if (!res.ok && res.status !== 204 && res.status !== 404) {
-      const body = await res.text().catch(() => "");
-      raiseError(`abortMultipart failed (${res.status}): ${body}`);
+    if (!res.ok && res.status !== 404) {
+      raiseError(`abortMultipart failed (${res.status}): ${errBody}`);
     }
   }
 }

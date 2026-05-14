@@ -315,69 +315,76 @@ export class S3Core extends EventTarget {
     // into the same branch.
     if (normalised === null && this._error === null) return;
 
-    // Attach a non-enumerable `toJSON` so that `JSON.stringify(core.error)`
-    // produces a serialisable payload (Error instances would otherwise become
-    // `{}`). Using `defineProperty` with `enumerable: false` avoids altering
-    // the shape consumers observe via `for…in` / `Object.keys`, and the
-    // non-enumerable flag keeps tools that iterate own properties unchanged.
-    // Guard with an own-property check so we do not re-define on errors that
-    // already carry a `toJSON` (or ones the monkey-patch has previously
-    // stamped — this method is re-entrant for the same error across multiple
-    // dispatch paths). Plain `SerializedError` payloads are already
-    // JSON-safe, so the monkey-patch only applies to real Error instances.
-    let payload: WcsS3AnyError = normalised;
-    if (
-      normalised instanceof Error
-      && !Object.prototype.hasOwnProperty.call(normalised, "toJSON")
-      && typeof (normalised as { toJSON?: unknown }).toJSON !== "function"
-    ) {
-      try {
-        Object.defineProperty(normalised, "toJSON", {
-          value: () => ({
-            name: normalised.name,
-            message: normalised.message,
-            ...(normalised.stack ? { stack: normalised.stack } : {}),
-          }),
-          enumerable: false,
-          configurable: true,
-          writable: true,
-        });
-      } catch (defineErr) {
-        // Frozen / sealed errors (exotic error classes, cross-realm errors)
-        // cannot have properties defined on them. Without a toJSON, the
-        // remote serialiser would emit `{}` (Error's own enumerable
-        // own-properties are empty) and the wire payload would be a
-        // useless empty object even though a real error fired.
-        //
-        // Substitute a plain SerializedError-shaped clone in the
-        // *dispatched detail* only — `this._error` keeps the original
-        // Error reference so local-mode `instanceof Error` checks on the
-        // getter still pass. This narrows the discrepancy to
-        // exactly the listeners that observe `event.detail`, which is
-        // also the path that hits the JSON serialiser remotely.
-        //
-        // Warn once via console so operators get a single signal that the
-        // monkey-patch fell back. We deliberately do not throw — the
-        // upload already failed, surfacing a second error here would
-        // double-dispatch. Guard the warn so a console-less environment
-        // (some runtimes wipe console for sandboxing) does not turn the
-        // fallback into its own crash.
-        if (typeof console !== "undefined" && typeof console.warn === "function") {
-          console.warn(
-            "[@csbc-dev/s3-uploader] could not attach toJSON to error (frozen/sealed); " +
-            "dispatching SerializedError shape instead.",
-            defineErr,
-          );
-        }
-        payload = {
-          name: normalised.name,
-          message: normalised.message,
-          ...(normalised.stack ? { stack: normalised.stack } : {}),
-        };
+    // Make the error JSON-safe for the remote transport (`JSON.stringify` of a
+    // bare Error collapses to `{}`). `_makeErrorJsonSafe` attaches a
+    // non-enumerable `toJSON` in place when it can, or returns a plain
+    // `SerializedError` clone when the error is frozen / sealed.
+    const { payload, fellBack, defineErr } = this._makeErrorJsonSafe(normalised);
+    if (fellBack) {
+      // Frozen / sealed errors cannot carry a `toJSON`, so the *dispatched
+      // detail* is a SerializedError-shaped clone while `this._error` keeps
+      // the original reference (local-mode `instanceof Error` checks still
+      // pass). Warn once so operators get a single signal; do not throw — the
+      // upload already failed and a second throw here would double-dispatch.
+      // Guard the warn for console-less sandboxed runtimes.
+      if (typeof console !== "undefined" && typeof console.warn === "function") {
+        console.warn(
+          "[@csbc-dev/s3-uploader] could not attach toJSON to error (frozen/sealed); " +
+          "dispatching SerializedError shape instead.",
+          defineErr,
+        );
       }
     }
     this._error = normalised;
     this._target.dispatchEvent(new CustomEvent("s3-uploader:error", { detail: payload, bubbles: true }));
+  }
+
+  /**
+   * Make a normalised error value JSON-safe for the remote transport. Real
+   * `Error` instances get a non-enumerable `toJSON` defined in place (so
+   * `JSON.stringify` emits `{ name, message, stack? }` instead of `{}`, while
+   * `for…in` / `Object.keys` shape is unchanged and local `instanceof Error`
+   * still holds). Plain `SerializedError` payloads are already JSON-safe and
+   * pass through untouched. Frozen / sealed errors cannot have properties
+   * defined on them — for those, `payload` is a plain SerializedError clone
+   * and `fellBack` is true so the caller can decide whether to warn.
+   *
+   * Shared by `_setError` and the warning-event serialiser so the monkey-patch
+   * logic lives in exactly one place.
+   */
+  private _makeErrorJsonSafe(
+    normalised: WcsS3AnyError,
+  ): { payload: WcsS3AnyError; fellBack: boolean; defineErr?: unknown } {
+    if (
+      !(normalised instanceof Error)
+      || Object.prototype.hasOwnProperty.call(normalised, "toJSON")
+      || typeof (normalised as { toJSON?: unknown }).toJSON === "function"
+    ) {
+      return { payload: normalised, fellBack: false };
+    }
+    try {
+      Object.defineProperty(normalised, "toJSON", {
+        value: () => ({
+          name: normalised.name,
+          message: normalised.message,
+          ...(normalised.stack ? { stack: normalised.stack } : {}),
+        }),
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+      return { payload: normalised, fellBack: false };
+    } catch (defineErr) {
+      return {
+        payload: {
+          name: normalised.name,
+          message: normalised.message,
+          ...(normalised.stack ? { stack: normalised.stack } : {}),
+        },
+        fellBack: true,
+        defineErr,
+      };
+    }
   }
 
   // --- rAF batching for progress events ---
@@ -650,41 +657,16 @@ export class S3Core extends EventTarget {
    * (`s3-uploader:postprocess-warning`, `s3-uploader:abort-cleanup-warning`). These
    * detail payloads cross the WebSocket via the wc-bindable remote transport,
    * where `JSON.stringify(Error)` collapses an `Error` instance to `{}` because
-   * the standard fields are non-enumerable. Mirroring `_setError`'s monkey-patch
-   * approach — define a non-enumerable `toJSON` on the original error so local
-   * `instanceof Error` consumers still see the live reference, while remote
-   * consumers see `{ name, message, stack? }`. Falls back to the same plain-
-   * object serialisation `_setError` uses when the error is frozen / sealed and
-   * `defineProperty` rejects, so no consumer ever sees `{}` for a real failure.
+   * the standard fields are non-enumerable. Shares `_makeErrorJsonSafe` with
+   * `_setError`: a non-enumerable `toJSON` is defined on the original error so
+   * local `instanceof Error` consumers still see the live reference, while
+   * remote consumers see `{ name, message, stack? }`. Falls back to a plain-
+   * object clone when the error is frozen / sealed — unlike `_setError`, the
+   * warning path does not console.warn on fallback (it is already a non-fatal
+   * channel).
    */
   private _serialiseWarningError(err: unknown): unknown {
-    const normalised = normaliseError(err);
-    if (
-      normalised instanceof Error
-      && !Object.prototype.hasOwnProperty.call(normalised, "toJSON")
-      && typeof (normalised as { toJSON?: unknown }).toJSON !== "function"
-    ) {
-      try {
-        Object.defineProperty(normalised, "toJSON", {
-          value: () => ({
-            name: normalised.name,
-            message: normalised.message,
-            ...(normalised.stack ? { stack: normalised.stack } : {}),
-          }),
-          enumerable: false,
-          configurable: true,
-          writable: true,
-        });
-        return normalised;
-      } catch {
-        return {
-          name: normalised.name,
-          message: normalised.message,
-          ...(normalised.stack ? { stack: normalised.stack } : {}),
-        };
-      }
-    }
-    return normalised;
+    return this._makeErrorJsonSafe(normaliseError(err)).payload;
   }
 
   /**
@@ -742,6 +724,23 @@ export class S3Core extends EventTarget {
     // and download presign target the bucket/prefix the bytes actually live
     // at, even if `this.bucket`/`this.prefix` were mutated mid-flight.
     const opts = snapshot?.options ?? this._baseRequestOptions();
+    // Every observable mutation below is reached only after the early
+    // validation block above has passed, so `complete()` honours the same
+    // "fail before any side effect" contract as `requestUpload`. The
+    // distinction is the failure path: when a post-process hook throws, the
+    // `completing`-phase progress is left in place on purpose — it records
+    // that the upload itself succeeded and the failure happened during
+    // finalization, which the `error` signal then qualifies. It is not reset
+    // to `idle` because the bytes are on S3 and a retry of `complete()` (not a
+    // fresh upload) is the correct recovery.
+    //
+    // Note the `completing` progress is emitted here, before the post-process
+    // stale check below. A `complete()` that lost its generation (a newer
+    // `requestUpload`/`abort` ran first) can therefore flash `completing` once
+    // before bailing at the `!stillCurrent` return. This is intentional and
+    // consistent with the "the new generation owns the slot" model: the stale
+    // call observes the world as of its own generation, and the newer
+    // generation's own progress events immediately overwrite the flash.
     this._cancelFlush();
     // PUT has returned successfully, so the uploading phase is "100% done".
     // Snap loaded and total to the same value so the progress bar lands at
@@ -776,7 +775,11 @@ export class S3Core extends EventTarget {
       if (!stillCurrent) return "";
       const download = await this._provider.presignDownload(key, opts);
       this._setUrl(download.url);
-      this._setProgress({ loaded: ctx.size ?? 0, total: ctx.size ?? 0, phase: "done" });
+      // Fall back to the `completing`-phase total, not 0, so a `requestUpload`
+      // with no `size` does not regress progress from N/N back to 0/0 on the
+      // final phase transition.
+      const doneTotal = ctx.size ?? this._progress.total;
+      this._setProgress({ loaded: doneTotal, total: doneTotal, phase: "done" });
       this._setUploading(false);
       this._setCompleted(true);
       this._setLoading(false);
@@ -802,22 +805,50 @@ export class S3Core extends EventTarget {
     }
   }
 
+  /**
+   * Mint a presigned GET URL for an existing object and publish it on `url`.
+   *
+   * Unlike `deleteObject`, this does NOT drive the `loading` property. It is a
+   * legal command to run while an upload is in flight, and `loading` belongs
+   * to that upload's lifecycle — toggling it here would falsely signal the
+   * upload had finished. The download presign is fast and side-effect-free, so
+   * callers needing a busy signal can await the returned promise directly.
+   */
   async requestDownload(key: string): Promise<PresignedDownload> {
     if (!key) raiseError("key is required.");
+    // Capture the generation so a presign failure here cannot clobber the
+    // `_error` of an upload that is concurrently in flight. `requestDownload`
+    // is a legal command to run mid-upload; without the guard a failed
+    // download presign would call `_setError` and spuriously fire
+    // `s3-uploader:error` against the active upload's generation. Symmetric
+    // with the generation guards in requestUpload / complete /
+    // requestMultipartUpload / completeMultipart.
+    const gen = this._generation;
     this._setError(null);
     try {
       const result = await this._provider.presignDownload(key, this._baseRequestOptions());
-      this._setKey(key);
-      this._setUrl(result.url);
+      if (gen === this._generation) {
+        this._setKey(key);
+        this._setUrl(result.url);
+      }
       return result;
     } catch (e: unknown) {
-      this._setError(e);
+      if (gen === this._generation) this._setError(e);
       throw e;
     }
   }
 
   async deleteObject(key: string): Promise<void> {
     if (!key) raiseError("key is required.");
+    // Capture the generation so a delete that races a concurrent upload
+    // cannot clobber that upload's observable state. `deleteObject` is a
+    // legal command to run mid-upload (against a different key, or the same
+    // key after an explicit `abort()`); without the guard a failed delete's
+    // `_setError(e)` would overwrite the in-flight upload's `_error` and
+    // spuriously fire `s3-uploader:error` against its generation — the same
+    // race `requestDownload` already guards. The `loading` side is protected
+    // separately via `driveLoading` below.
+    const gen = this._generation;
     // Detect delete-during-active-upload on the SAME key before the network
     // call. Core does not attempt to automatically cancel the upload — both
     // flows are legitimate protocols the caller may have reasons to run —
@@ -852,22 +883,36 @@ export class S3Core extends EventTarget {
     // snapshot; deleteObject must do the same for consistency and so the
     // warning is honest about what got deleted.
     const opts = activeUploadSnapshot?.options ?? this._baseRequestOptions();
+    // Only drive `loading` when no upload is in flight. `loading` belongs to
+    // the upload lifecycle; toggling it from a concurrent `deleteObject` would
+    // overwrite an active upload's `loading=true` and then — in the `finally`
+    // — publish a spurious `loading=false`, falsely signalling the upload had
+    // finished. Symmetric with `requestDownload`, which skips `loading` for
+    // the same reason. When there is no active upload, `deleteObject` owns the
+    // busy signal and drives it as before.
+    const driveLoading = !this._uploading;
     this._setError(null);
-    this._setLoading(true);
+    if (driveLoading) this._setLoading(true);
     try {
       await this._provider.deleteObject(key, opts);
-      // Clear url/etag if the deleted key matches the current state.
-      if (this._key === key) {
+      // Clear url/etag if the deleted key matches the current state — but only
+      // if a newer request has not superseded us mid-flight. Otherwise this
+      // delete would blow away the state a concurrent upload just published.
+      if (gen === this._generation && this._key === key) {
         this._setUrl("");
         this._setEtag("");
         this._setCompleted(false);
         this._setMetadata(null);
       }
     } catch (e: unknown) {
-      this._setError(e);
+      // Only surface the error against our own generation. A newer upload
+      // that started while this delete was in flight owns `_error` now;
+      // overwriting it here would misattribute the delete failure to that
+      // upload. The awaiting caller still sees the throw regardless.
+      if (gen === this._generation) this._setError(e);
       throw e;
     } finally {
-      this._setLoading(false);
+      if (driveLoading) this._setLoading(false);
     }
   }
 
@@ -1182,7 +1227,10 @@ export class S3Core extends EventTarget {
       // The download must point at the path the bytes actually live at.
       const download = await this._provider.presignDownload(key, mpOptions);
       this._setUrl(download.url);
-      this._setProgress({ loaded: ctx.size ?? 0, total: ctx.size ?? 0, phase: "done" });
+      // Fall back to the `completing`-phase total, not 0, so progress does not
+      // regress from N/N back to 0/0 on the final phase transition.
+      const doneTotal = ctx.size ?? this._progress.total;
+      this._setProgress({ loaded: doneTotal, total: doneTotal, phase: "done" });
       this._setUploading(false);
       this._setCompleted(true);
       this._setLoading(false);
@@ -1245,7 +1293,9 @@ export class S3Core extends EventTarget {
       // from external state, or a different uploadId against the same key
       // that the Core never saw). We have no snapshot, so use current
       // inputs — it is the caller's responsibility to have the right
-      // bucket/prefix configured before invoking this case.
+      // bucket/prefix configured before invoking this case. A live
+      // `_multipart` carrying a different uploadId is intentionally left
+      // untouched: it is a separate upload and this abort does not concern it.
       opts = this._baseRequestOptions();
     }
     await this._provider.abortMultipart(key, uploadId, opts);

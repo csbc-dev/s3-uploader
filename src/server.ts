@@ -23,6 +23,10 @@ export type {
 } from "./signing/sigv4.js";
 export { retryWithBackoff, defaultPutRetryPolicy, PutHttpError, MissingEtagError } from "./retry.js";
 export type { RetryOptions, S3OwnedError } from "./retry.js";
+// `WcsS3Values` is intentionally NOT re-exported here: it extends
+// `WcsS3CoreValues` with `trigger`, a Shell-only property that has no meaning
+// server-side. Server consumers bind against the Core, whose value shape is
+// `WcsS3CoreValues`.
 export type {
   IS3Provider, S3RequestOptions, PresignedUpload, PresignedDownload,
   S3ObjectMetadata, S3Progress, PostProcessHook, PostProcessContext,

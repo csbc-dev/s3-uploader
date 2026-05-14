@@ -198,6 +198,19 @@ function formatAmzDate(d: Date): { amzDate: string; dateStamp: string } {
 }
 
 function buildHost(bucket: string, region: string, endpoint: string | undefined, pathStyle: boolean): { host: string; pathPrefix: string; protocol: string } {
+  // Virtual-hosted style splices the bucket name into the hostname
+  // (`<bucket>.s3.<region>.amazonaws.com`). A bucket name containing a dot
+  // then (a) breaks the `*.s3.<region>.amazonaws.com` TLS wildcard so HTTPS
+  // PUTs fail cert validation, and (b) can produce an ambiguous host. AWS's
+  // own guidance is to use path style for dotted bucket names. Reject here
+  // with an actionable message rather than emitting a URL that 526s/SSL-errors
+  // opaquely at PUT time. Path style and custom endpoints are unaffected — the
+  // bucket is a path segment there, not part of the host.
+  if (!pathStyle && !endpoint && bucket.includes(".")) {
+    throw new Error(
+      `[@csbc-dev/s3-uploader] bucket "${bucket}" contains a dot, which breaks the virtual-hosted-style TLS wildcard. Use forcePathStyle: true for dotted bucket names.`,
+    );
+  }
   if (endpoint) {
     const u = new URL(endpoint);
     const host = u.host;
@@ -259,8 +272,9 @@ export async function presignS3Url(
   // discarded. Reject non-finite values, non-positive values, and values
   // above the S3 ceiling loudly instead; truncate with `Math.trunc` for
   // floats so the subsequent arithmetic stays integer-valued. The
-  // `Math.max(1, ...)` below is retained as a defensive floor in case future
-  // refactors reintroduce a signed-int coercion path.
+  // `Math.max(1, ...)` below floors the result to 1 second: a fractional
+  // `expiresInSeconds` in (0, 1) passes the positivity check above but
+  // `Math.trunc`s to 0, which would otherwise produce an already-expired URL.
   const rawExpires = params.expiresInSeconds;
   if (!Number.isFinite(rawExpires)) {
     throw new Error(`[@csbc-dev/s3-uploader] expiresInSeconds must be a finite number, got ${rawExpires}.`);

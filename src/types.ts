@@ -94,6 +94,14 @@ export interface S3RequestOptions {
   bucket: string;
   prefix?: string;
   contentType?: string;
+  /**
+   * Presigned-URL lifetime in seconds. Honoured by `AwsS3Provider`, but NOT
+   * driven by `S3Core` — `S3Core._baseRequestOptions()` never sets it, so in
+   * the standard Shell→Core flow the provider's `defaultExpiresInSeconds`
+   * always applies. This field is for provider-wrapper code that constructs
+   * `S3RequestOptions` directly (e.g. a wrapper that shortens lifetimes for
+   * sensitive prefixes).
+   */
   expiresInSeconds?: number;
 }
 

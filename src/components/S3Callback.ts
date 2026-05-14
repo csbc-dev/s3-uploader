@@ -100,6 +100,22 @@ export class S3Callback extends HTMLElement {
     if (!this.isConnected) return;
 
     const src = this.getAttribute("src");
+    // Reject `javascript:` / `data:` / `vbscript:` URLs before they reach
+    // `import()`. These schemes turn the `src` attribute into a direct
+    // script-injection sink — `import("data:text/javascript,...")` executes
+    // attacker-controlled code with no network fetch at all, sidestepping
+    // even a `connect-src` CSP. The broader untrusted-HTML warning still
+    // stands (see the class doc); this is the minimum mechanical guard so a
+    // single injected attribute cannot run code on its own.
+    if (src) {
+      const scheme = /^\s*([a-z][a-z0-9+.-]*):/i.exec(src)?.[1]?.toLowerCase();
+      if (scheme === "javascript" || scheme === "data" || scheme === "vbscript") {
+        this._dispatchLocalError(new Error(
+          `[@csbc-dev/s3-uploader] <s3-callback> refuses to load a "${scheme}:" src URL.`,
+        ));
+        return;
+      }
+    }
     let moduleUrl: string;
     // Capture THIS invocation's blob URL locally so a subsequent
     // _loadModule(gen+1) that overwrites `this._blobUrl` with a newer blob
