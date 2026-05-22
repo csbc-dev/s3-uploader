@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>@wcstack/state — @csbc-dev/s3-uploader (remote mode)</title>
+    <style>
+      :root { color-scheme: light; }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; font: 14px/1.6 system-ui, "Segoe UI", sans-serif; color: #1a1a2e; background: #f4f5fa; }
+      .app { width: min(640px, calc(100vw - 32px)); margin: 0 auto; padding: 32px 0 64px; }
+      .hero h1 { margin: 0 0 4px; font-size: 1.6rem; letter-spacing: -0.02em; }
+      .hero p { margin: 0 0 20px; color: #5c5c7a; }
+      .card { background: #fff; border: 1px solid #e3e4ee; border-radius: 16px; box-shadow: 0 12px 36px rgba(26,26,46,.07); overflow: hidden; }
+      .card-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: 1px solid #eef0f6; }
+      .card-head h2 { margin: 0; font-size: .95rem; }
+      .badge { padding: 3px 10px; border-radius: 999px; background: #eef0ff; color: #4f46e5; font-size: .78rem; font-weight: 600; text-transform: capitalize; }
+      .badge.done { background: #ecfdf5; color: #059669; }
+      .badge.error { background: #fef2f2; color: #dc2626; }
+      .body { padding: 18px; display: flex; flex-direction: column; gap: 16px; }
+      .drop { border: 1.5px dashed #c7c9da; border-radius: 12px; padding: 22px; text-align: center; background: #fafbff; }
+      .drop input[type=file] { font: inherit; max-width: 100%; }
+      .file-info { margin-top: 10px; font-size: .85rem; color: #5c5c7a; }
+      .file-info strong { color: #1a1a2e; }
+      .controls { display: flex; gap: 8px; }
+      .btn { border: 0; background: #6366f1; color: #fff; border-radius: 10px; padding: 10px 18px; font: inherit; font-weight: 600; cursor: pointer; }
+      .btn:disabled { opacity: .5; cursor: not-allowed; }
+      .btn.ghost { background: #eef0f6; color: #1a1a2e; }
+      .progress { display: flex; flex-direction: column; gap: 6px; }
+      progress { width: 100%; height: 10px; border-radius: 999px; overflow: hidden; appearance: none; -webkit-appearance: none; border: 0; background: #eef0f6; }
+      progress::-webkit-progress-bar { background: #eef0f6; border-radius: 999px; }
+      progress::-webkit-progress-value { background: #6366f1; border-radius: 999px; }
+      progress::-moz-progress-bar { background: #6366f1; border-radius: 999px; }
+      .progress-meta { display: flex; justify-content: space-between; font-size: .78rem; color: #5c5c7a; text-transform: capitalize; }
+      .result { border: 1px solid #d1fae5; background: #f0fdf9; border-radius: 12px; padding: 14px; font-size: .85rem; }
+      .result h3 { margin: 0 0 8px; font-size: .9rem; color: #059669; }
+      .result dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
+      .result dt { color: #5c5c7a; }
+      .result dd { margin: 0; word-break: break-all; }
+      .result a { color: #4f46e5; font-weight: 600; }
+      .err { margin: 0; padding: 10px 14px; border-radius: 12px; background: #fef2f2; color: #dc2626; border: 1px solid #fecaca; font-size: .85rem; word-break: break-word; }
+    </style>
+
+    <!-- Set the remote Core URL BEFORE the auto/remoteEnv bundle loads. A
+         classic inline script runs during parse, ahead of the deferred module
+         scripts below. The /auto/remoteEnv entrypoint calls bootstrapS3() with
+         remoteSettingType: "env", and <s3-uploader> resolves
+         globalThis.S3_REMOTE_CORE_URL when it opens its connection. -->
+    <script>
+      window.S3_REMOTE_CORE_URL = "ws://localhost:8080/s3-uploader";
+    </script>
+
+    <!-- CDN-loaded — no bundler.
+         PRE-PUBLISH: `@csbc-dev/s3-uploader` is NOT on npm yet, so the esm.run
+         URL below 404s and this page does NOT work as committed. Until publish,
+         serve the REPO ROOT (after `npm run build`) and swap that one line for
+         a root-absolute local path:
+           <script type="module" src="/src/auto/remoteEnv.js"></script>
+         Leave the @wcstack/state line on its CDN URL (already published).
+         See README.md "Note (running before npm publish)" for the full recipe. -->
+    <script type="module" src="https://esm.run/@wcstack/state/auto"></script>
+    <script type="module" src="https://esm.run/@csbc-dev/s3-uploader/auto/remoteEnv"></script>
+  </head>
+  <body>
+    <!-- The reactive store. wcstack/state applies the `data-wcs` bindings on
+         the following siblings (the <s3-uploader> element and <main>). -->
+    <wcs-state>
+      <script type="module">
+        function fmtBytes(n) {
+          if (n == null || Number.isNaN(n)) return "";
+          if (n === 0) return "0 B";
+          const units = ["B", "KB", "MB", "GB", "TB"];
+          const i = Math.min(units.length - 1, Math.floor(Math.log(n) / Math.log(1024)));
+          return `${(n / 1024 ** i).toFixed(i === 0 ? 0 : 1)} ${units[i]}`;
+        }
+
+        export default {
+          // Setting this true flips <s3-uploader>'s `trigger` property, which
+          // calls upload(). <s3-uploader> resets `trigger` to false when the
+          // run settles, and the binding mirrors that back here.
+          uploadRequested: false,
+
+          // <s3-uploader> output state, mirrored in by the bindings below. In
+          // remote mode these are synced from the server-side Core over
+          // WebSocket — the binding declaration is identical to a local one.
+          progress: { loaded: 0, total: 0, phase: "idle" },
+          loading: false,
+          uploading: false,
+          completed: false,
+          url: "",
+          key: "",
+          etag: "",
+          metadata: null,
+          // The element's `error` output is bound to the store key `s3error`
+          // (not `error`) — see `error: s3error` in the data-wcs string below.
+          // Renamed only to avoid shadowing the page's global `error` (the DOM
+          // `window.onerror`/ErrorEvent surface) inside the store scope; the
+          // other three clients keep `error` because their state lives in a
+          // local object, not a global-ish store. Behaviour is identical.
+          s3error: null,
+
+          // Local UI state for the picked file (a File object cannot travel
+          // through a `data-wcs` binding, so we set <s3-uploader>.file
+          // imperatively in onPick and just track its name/size here).
+          fileName: "",
+          fileSize: 0,
+          hasFile: false,
+
+          get busy() { return this.loading || this.uploading; },
+          // `!completed` blocks re-pressing Upload after a finished run, which
+          // would PUT the same file to the same key again.
+          get canUpload() { return this.hasFile && !this.busy && !this.completed; },
+          // Single rounded 0..100 basis for BOTH the bar and the label, so they
+          // never disagree (e.g. bar 99.4% / label "99%"). The other three
+          // clients also drive bar + label off one rounded percent; this keeps
+          // the "identical card" promise. The native <progress> below uses
+          // max="100" with this value.
+          get progressPercent() {
+            const p = this.progress;
+            return p && p.total ? Math.round((p.loaded / p.total) * 100) : 0;
+          },
+          get percentLabel() {
+            return `${this.progressPercent}%`;
+          },
+          get phaseLabel() { return this.progress?.phase ?? ""; },
+          get status() {
+            if (this.s3error) return "Error";
+            if (this.completed) return "Done";
+            if (this.busy) return this.progress?.phase ?? "Working";
+            return "Ready";
+          },
+          // Mutually exclusive badge variants (data-wcs has no class toggling
+          // here, so we drive three templates instead).
+          get badgeError() { return !!this.s3error; },
+          get badgeDone() { return this.completed && !this.s3error; },
+          get badgePlain() { return !this.completed && !this.s3error; },
+
+          get fileLabel() {
+            return this.fileName ? `${this.fileName} · ${fmtBytes(this.fileSize)}` : "";
+          },
+          get showResult() { return this.completed && !!this.url; },
+          get sizeLabel() {
+            return this.metadata && this.metadata.size != null ? fmtBytes(this.metadata.size) : "";
+          },
+          get urlLabel() { return "Open presigned download URL ↗"; },
+          get errorMessage() {
+            // `error` is S3Error | Error | SerializedError | null. Every
+            // non-null shape carries a `message`; fall back to String()
+            // otherwise. Kept logically identical to the framework clients'
+            // errorText() so the four examples behave the same.
+            const e = this.s3error;
+            if (!e) return "";
+            if (e instanceof Error) return e.message;
+            if (typeof e === "object" && e !== null && "message" in e) {
+              const m = e.message;
+              if (m) return String(m);
+            }
+            return String(e);
+          },
+
+          onPick(e) {
+            const f = e.target.files && e.target.files[0];
+            // Setting `file` is passive — stored for the next upload().
+            const el = document.getElementById("s3");
+            el.file = f || null;
+            // Reset Core state when a NEW file is picked. `completed` is a
+            // Core-mirrored output (bound to `completed` here): it stays true
+            // after a finished upload and is NOT cleared by setting `file`.
+            // Without this, `canUpload`'s `!completed` term would stay false and
+            // block a second file for the rest of the page load. `abort()` at
+            // idle is safe — it dispatches no error, just resets completed /
+            // url / etag / metadata / progress to the clean state (verified in
+            // S3Core.abort()); the mirror flows the reset back into the store.
+            el.abort();
+            this.fileName = f ? f.name : "";
+            this.fileSize = f ? f.size : 0;
+            this.hasFile = !!f;
+          },
+          startUpload() {
+            if (!this.hasFile || this.busy || this.completed) return;
+            // Rising edge of `trigger` starts the run; <s3-uploader> resets it.
+            this.uploadRequested = true;
+          },
+          abort() {
+            document.getElementById("s3").abort();
+          },
+        };
+      </script>
+    </wcs-state>
+
+    <!--
+      Headless I/O node — in remote mode it proxies a server-side Core over
+      WebSocket and runs the browser-side upload. No `bucket` / credentials:
+      the server owns them.
+
+      The `data-wcs` string wires the store to the element:
+        - `trigger` is a store-driven input (the upload command).
+        - everything else is output state mirrored back into the store.
+
+      multipart-threshold="8388608" (8 MiB) is the package DEFAULT, set
+      explicitly only to mark where you'd tune the single-PUT vs. multipart
+      cutover; lower it to force the multipart path for demos.
+    -->
+    <s3-uploader
+      id="s3"
+      multipart-threshold="8388608"
+      data-wcs="
+        trigger:    uploadRequested;
+        progress:   progress;
+        loading:    loading;
+        uploading:  uploading;
+        completed:  completed;
+        url:        url;
+        key:        key;
+        etag:       etag;
+        metadata:   metadata;
+        error:      s3error
+      ">
+    </s3-uploader>
+
+    <main>
+      <div class="app">
+        <div class="hero">
+          <h1>@wcstack/state — @csbc-dev/s3-uploader</h1>
+          <p><code>data-wcs</code> wires <code>&lt;s3-uploader&gt;</code> into a <code>&lt;wcs-state&gt;</code> store; the Core runs on the WebSocket server. CDN-loaded, no bundler.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>Upload</h2>
+            <template data-wcs="if: badgeError">
+              <span class="badge error" data-wcs="textContent: status"></span>
+            </template>
+            <template data-wcs="if: badgeDone">
+              <span class="badge done" data-wcs="textContent: status"></span>
+            </template>
+            <template data-wcs="if: badgePlain">
+              <span class="badge" data-wcs="textContent: status"></span>
+            </template>
+          </div>
+
+          <div class="body">
+            <div class="drop">
+              <input type="file" data-wcs="onchange: onPick" aria-label="Choose a file to upload" />
+              <template data-wcs="if: hasFile">
+                <div class="file-info" data-wcs="textContent: fileLabel"></div>
+              </template>
+            </div>
+
+            <div class="controls">
+              <button class="btn" data-wcs="onclick: startUpload; disabled: canUpload|not">Upload</button>
+              <template data-wcs="if: busy">
+                <button class="btn ghost" data-wcs="onclick: abort">Abort</button>
+              </template>
+            </div>
+
+            <template data-wcs="if: busy">
+              <div class="progress">
+                <progress max="100" data-wcs="value: progressPercent"></progress>
+                <div class="progress-meta">
+                  <span data-wcs="textContent: phaseLabel"></span>
+                  <span data-wcs="textContent: percentLabel"></span>
+                </div>
+              </div>
+            </template>
+
+            <template data-wcs="if: showResult">
+              <div class="result">
+                <h3>Uploaded ✓</h3>
+                <dl>
+                  <dt>key</dt><dd data-wcs="textContent: key"></dd>
+                  <dt>etag</dt><dd data-wcs="textContent: etag"></dd>
+                  <dt>size</dt><dd data-wcs="textContent: sizeLabel"></dd>
+                </dl>
+                <p style="margin:10px 0 0"><a target="_blank" rel="noopener" data-wcs="href: url; textContent: urlLabel"></a></p>
+              </div>
+            </template>
+
+            <template data-wcs="if: s3error">
+              <p class="err" data-wcs="textContent: errorMessage"></p>
+            </template>
+          </div>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>

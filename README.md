@@ -903,9 +903,22 @@ The default barrel is browser-targeted on purpose. Importing it from Node
 fails at module evaluation (`HTMLElement is not defined`); use `/server`
 for any code that runs outside a browser.
 
-## End-to-end example
+## End-to-end examples
 
-A runnable demo (HTTP + WS server, sample `<s3-callback>` set, server-side post-process hook) lives under [examples/s3-remote/](https://github.com/wc-bindable-protocol/wc-bindable-protocol/tree/main/examples/s3-remote).
+Runnable demos live under [examples/](examples/): one shared WebSocket server
+(`S3Core` + `RemoteShellProxy`, server-side credentials, prefix scoping, a
+post-process hook) backing four upload clients — the same surface built four
+ways:
+
+| Client | Stack | Binding style |
+|---|---|---|
+| [examples/vanilla/](examples/vanilla/) | Vite + `bind()` | imperative |
+| [examples/react/](examples/react/) | Vite + React 19 + `@wc-bindable/react` | `useWcBindable` (callback ref + fan-out) |
+| [examples/vue/](examples/vue/) | Vite + Vue 3 + `@wc-bindable/vue` | `useWcBindable` composable |
+| [examples/wcstack-state/](examples/wcstack-state/) | CDN `<wcs-state>` + `data-wcs` | declarative HTML |
+
+Start [examples/server/](examples/server/) first, then any client — see the
+[examples README](examples/README.md) for the full run order and port table.
 
 ## License
 
