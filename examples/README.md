@@ -1,6 +1,6 @@
 # `@csbc-dev/s3-uploader` examples
 
-The same file-upload surface, built four ways — once per framework binding style — all driven by one shared WebSocket server.
+The same file-upload surface, built four ways — once per framework binding style — all driven by one shared WebSocket Core host and served by one static delivery server.
 
 `@csbc-dev/s3-uploader` is a **Case C** package: the Core (`S3Core`) holds the
 AWS credentials and signs every URL on the **server**, while the Shell
@@ -13,7 +13,8 @@ traverse that socket** — only signing requests, progress, and completion do.
 
 | Project | Stack | Demonstrates |
 |---|---|---|
-| [`server/`](server/) | Node + `ws` + `@wc-bindable/remote` | `S3Core` + `RemoteShellProxy`, server-side credentials, prefix scoping, post-process hook |
+| [`server/`](server/) | Node + `ws` + `@wc-bindable/remote` | The **Core host**: `S3Core` + `RemoteShellProxy`, server-side credentials, prefix scoping, post-process hook |
+| [`delivery/`](delivery/) | Node built-ins only | One **static delivery server** that serves every built client at its fixed port |
 | [`vanilla/`](vanilla/) | Vite + `bind()` from `@wc-bindable/core` | Pure-JS imperative binding |
 | [`react/`](react/) | Vite + React 19 + `@wc-bindable/react` | `useWcBindable` (callback ref + fan-out) |
 | [`vue/`](vue/) | Vite + Vue 3 + `@wc-bindable/vue` | `useWcBindable` composable |
@@ -39,9 +40,11 @@ npm run build
 
 ## Run order
 
-Start the shared server first, then any one client.
+The clients are **built**, then served statically — not run from the Vite dev
+server. Start the Core host, build the three Vite clients, then start the
+delivery server.
 
-**1. Start the shared server:**
+**1. Start the Core host (`server/`):**
 
 ```bash
 cd examples/server
@@ -50,24 +53,37 @@ npm install
 npm run dev                # ws://localhost:8080/s3-uploader
 ```
 
-**2. Start any client (in another terminal):**
+**2. Build each Vite client (in another terminal):**
 
 ```bash
-cd examples/vanilla        # or react/, or vue/
+cd examples/vanilla        # then react/, then vue/
 cp .env.example .env       # edit VITE_S3_REMOTE_URL if the server is elsewhere
 npm install
-npm run dev
+npm run build              # → dist/  (VITE_S3_REMOTE_URL is baked in HERE)
 ```
 
-`wcstack-state/` has no bundler — see its [README](wcstack-state/README.md).
+`wcstack-state/` has no build step — it is served verbatim.
+
+**3. Start the static delivery server (`delivery/`):**
+
+```bash
+cd examples/delivery
+npm start                  # vanilla:5173 react:5174 vue:5175 wcstack-state:5176
+```
+
+Open any printed URL. See [`delivery/README.md`](delivery/README.md) for details.
+
+> **During development**, you can instead run a single Vite client with
+> `npm run dev` (hot reload) on its dev port — it hits the same Core host over
+> WebSocket. That is for iteration only; the canonical run is build + delivery.
 
 > **Pre-publish caveat (wcstack-state only):** unlike the three Vite clients,
 > `wcstack-state/index.html` loads `@csbc-dev/s3-uploader` from a CDN URL that
-> only resolves once the package is published to npm. Until then, opening the
-> committed file as-is gives a 404 — you must serve the repo root and swap that
-> one `<script src>` for a local build. The other three clients run from a clean
-> clone via `npm run dev`. See [`wcstack-state/README.md`](wcstack-state/README.md#setup)
-> for the exact steps.
+> only resolves once the package is published to npm. Until then, swap that one
+> `<script src>` for the root-absolute local build `/src/auto/remoteEnv.js` — the
+> `delivery/` server maps `/src/` and `/dist/` to the repo root so it resolves.
+> See [`wcstack-state/README.md`](wcstack-state/README.md#setup) for the exact
+> steps.
 
 ## What all four clients demonstrate
 
@@ -95,13 +111,16 @@ npm run dev
 
 ## Port assignments
 
+The Core host owns 8080; the four client ports are served by `delivery/` and are
+overridable via `VANILLA_PORT` / `REACT_PORT` / `VUE_PORT` / `WCSTACK_PORT`.
+
 | Project | Port |
 |---|---|
-| `server` | 8080 (WebSocket) |
-| `vanilla` | 5173 |
-| `react` | 5174 |
-| `vue` | 5175 |
-| `wcstack-state` | 5176 (static; the port the CORS allowlist below registers — serve it on 5176) |
+| `server` (Core host) | 8080 (WebSocket) |
+| `vanilla` | 5173 (served by `delivery/`) |
+| `react` | 5174 (served by `delivery/`) |
+| `vue` | 5175 (served by `delivery/`) |
+| `wcstack-state` | 5176 (served by `delivery/`; matches the CORS allowlist below) |
 
 ## S3 bucket CORS
 
@@ -131,8 +150,10 @@ in the package README. For an S3-compatible store (MinIO, R2, …) set
 
 ## See also
 
-- [`server/README.md`](server/README.md) — server internals: per-connection
+- [`server/README.md`](server/README.md) — Core-host internals: per-connection
   `S3Core`, credential handling, prefix scoping, post-process hooks.
+- [`delivery/README.md`](delivery/README.md) — the static delivery server: ports,
+  build prerequisites, and the wcstack-state pre-publish mapping.
 - [`../README.md`](../README.md) — full component documentation (API surface,
   multipart sizing, retry policy, error taxonomy, security responsibilities).
 - [`../CLAUDE.md`](../CLAUDE.md) — CSBC architecture context (why this is Case C).

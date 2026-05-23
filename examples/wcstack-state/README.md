@@ -2,8 +2,9 @@
 
 Static HTML page that uses `data-wcs` declarative bindings to wire
 `<s3-uploader>` into a `<wcs-state>` store, with `<s3-uploader>` running in
-**remote mode** — `S3Core` runs on the [shared server](../server/), the browser
-PUTs the file straight to S3. CDN-loaded — **no bundler, no install step**.
+**remote mode** — `S3Core` runs on the [Core host](../server/), the browser
+PUTs the file straight to S3. CDN-loaded — **no bundler, no install step**. The
+shared [`delivery/`](../delivery/) server serves this page verbatim on port 5176.
 
 > **Note (running before npm publish):** the CDN URL
 > `https://esm.run/@csbc-dev/s3-uploader/auto/remoteEnv` resolves only once the
@@ -13,10 +14,11 @@ PUTs the file straight to S3. CDN-loaded — **no bundler, no install step**.
 > `<script src>` on its CDN URL — that package is already published, so only the
 > `@csbc-dev/s3-uploader` line changes.
 >
-> A root-absolute path is required because `src/auto/remoteEnv.js` itself does
+> A root-absolute path is used because `src/auto/remoteEnv.js` itself does
 > `import "../../dist/index.js"`, so both `src/auto/` and `dist/` must be
-> reachable from the static server's root. That only works if the server is
-> rooted at the **repo root** (see step 3), not at this directory.
+> reachable from the serving root. The [`delivery/`](../delivery/) server maps
+> `/src/` and `/dist/` to the repo root for exactly this reason — so you do
+> **not** need to hand-serve the repo root yourself.
 >
 > **Verify the `@wcstack/state` CDN line.** This page assumes
 > `https://esm.run/@wcstack/state/auto` is the published side-effect bootstrap
@@ -27,7 +29,7 @@ PUTs the file straight to S3. CDN-loaded — **no bundler, no install step**.
 
 ## Setup
 
-1. Start the [shared server](../server/) first:
+1. Start the [Core host](../server/) first:
 
    ```bash
    cd ../server
@@ -42,26 +44,20 @@ PUTs the file straight to S3. CDN-loaded — **no bundler, no install step**.
    committed file already sets the default `ws://localhost:8080/s3-uploader`, so
    you can skip this step unless your server runs elsewhere.
 
-3. Using the CDN default (after publish), serve **this directory**; for the
-   pre-publish local build, serve the **repo root** so `/src/auto/` and `/dist/`
-   resolve:
-
-   Use port **5176** — it is the origin registered in the bucket's CORS
-   allowlist (see the [examples README](../README.md#s3-bucket-cors)). On any
-   other port the browser's direct PUT to S3 is blocked by CORS.
+3. Serve it with the shared [`delivery/`](../delivery/) server, which puts this
+   page on port **5176** — the origin registered in the bucket's CORS allowlist
+   (see the [examples README](../README.md#s3-bucket-cors)). On any other port
+   the browser's direct PUT to S3 is blocked by CORS.
 
    ```bash
-   # CDN default — serve this directory:
-   npx --yes serve -l 5176 .
-   # then open http://localhost:5176
-
-   # Pre-publish local build — serve the REPO ROOT instead:
-   #   (run from the repo root, after `npm run build`)
-   # npx --yes serve -l 5176 .
-   # then open http://localhost:5176/examples/wcstack-state/
+   cd ../delivery
+   npm start                  # serves wcstack-state on http://localhost:5176
    ```
 
-   `file://` will not work either way.
+   It serves `index.html` verbatim (CDN default), and also maps `/src/` and
+   `/dist/` to the repo root for the pre-publish local-build swap above — so the
+   same command works either way. To serve **only** this page on a custom port:
+   `WCSTACK_PORT=5176 node ../delivery/server.js`. `file://` will not work.
 
 ## How remote mode is enabled here
 

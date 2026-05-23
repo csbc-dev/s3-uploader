@@ -1,0 +1,14 @@
+{
+  "name": "csbc-s3-uploader-example-delivery",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Shared static delivery server for all @csbc-dev/s3-uploader front-end demos (vanilla / react / vue / wcstack-state). Dependency-free; the Core host is ../server.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}

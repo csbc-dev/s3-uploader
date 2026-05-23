@@ -101,7 +101,15 @@ picker.addEventListener("change", () => {
   // S3Core.abort()). It also clears the stale result block for the new file.
   s3.abort();
   fileInfo.hidden = !f;
-  if (f) fileInfo.innerHTML = `<strong>${f.name}</strong> · ${fmtBytes(f.size)}`;
+  if (f) {
+    // Build with the DOM API (not innerHTML) so a crafted file name cannot
+    // inject markup. Keeps this client's escaping identical to the react / vue /
+    // wcstack clients, which all render the name as text.
+    fileInfo.textContent = "";
+    const strong = document.createElement("strong");
+    strong.textContent = f.name;
+    fileInfo.append(strong, ` · ${fmtBytes(f.size)}`);
+  }
   render();
 });
 

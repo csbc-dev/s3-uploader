@@ -7,16 +7,21 @@ S3. Binding is done imperatively with `bind()` from
 
 ## Setup
 
-Start the [shared server](../server/) first, then:
+Start the [Core host](../server/) first. Then build this client and serve it via
+the shared [delivery server](../delivery/):
 
 ```bash
-cp .env.example .env       # then edit VITE_S3_REMOTE_URL if needed
+cp .env.example .env       # then edit VITE_S3_REMOTE_URL if needed (baked in at build time)
 npm install
-npm run dev                # http://localhost:5173
+npm run build              # → dist/
+cd ../delivery && npm start   # serves this client on http://localhost:5173
 ```
 
 > `@csbc-dev/s3-uploader` is referenced as `file:../..`. Run `npm install` and
 > `npm run build` in the repo root once first so `dist/` exists.
+>
+> For hot-reload during development you can run `npm run dev` here instead (Vite
+> dev server on :5173); the canonical run is build + delivery.
 
 ## Configuration
 
