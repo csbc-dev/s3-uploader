@@ -12,7 +12,7 @@
   },
   "dependencies": {
     "@csbc-dev/s3-uploader": "file:../..",
-    "@wc-bindable/remote": "^0.4.0",
+    "@wc-bindable/remote": "^0.7.0",
     "ws": "^8.20.0"
   }
 }

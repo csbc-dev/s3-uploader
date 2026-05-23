@@ -10,7 +10,7 @@
   },
   "dependencies": {
     "@csbc-dev/s3-uploader": "file:../..",
-    "@wc-bindable/react": "^0.4.0",
+    "@wc-bindable/react": "^0.7.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
