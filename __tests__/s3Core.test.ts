@@ -694,9 +694,9 @@ describe("S3Core", () => {
       expect(core.error).not.toHaveProperty("stack");
       expect(details).toEqual([{ name: "Error", message: "payload-check" }]);
       expect(isJsonValue(details[0])).toBe(true);
-      // The original instance is still reachable in-process (the local
-      // Shell reads it through `_localError`).
-      expect(core._localError).toBe(err);
+      // The original instance is still reachable in-process, through the
+      // public (undeclared) `originalError`.
+      expect(core.originalError).toBe(err);
     });
 
     it("the getter returns a copy, so a caller cannot mutate the published slot", async () => {
@@ -724,7 +724,9 @@ describe("S3Core", () => {
       expect((rejection as Error).message).toBe("denied");
       expect(core.error).toEqual({ name: "AccessDenied", message: "denied" });
       expect(isJsonValue(core.error)).toBe(true);
-      expect(core._localError).toBe(rejection);
+      // For a non-Error rejection, `originalError` is the Error the Core
+      // rethrew in its place.
+      expect(core.originalError).toBe(rejection);
     });
 
     it("rethrows a bare-string rejection as an Error with message === the string", async () => {
@@ -793,6 +795,77 @@ describe("S3Core", () => {
       await core.complete("k", "et");
       expect(warnings[0].error).not.toBe(frozen);
       expect(warnings[0].error).toMatchObject({ name: "Error", message: "frozen" });
+    });
+  });
+
+  describe("originalError — the exception behind `error`, for server-side code", () => {
+    // `error` is the plain `{ name, message }` the browser receives. Server
+    // code that logs / monitors failures needs the exception itself, and in
+    // a remote setup it never sees the command's rejection (RemoteShellProxy
+    // catches it and answers the client), so the Core exposes it.
+    function awsLikeError(): Error & { cause: unknown; $metadata: { httpStatusCode: number; requestId: string } } {
+      const cause = new Error("socket hang up");
+      return Object.assign(new Error("Access Denied"), {
+        name: "AccessDenied",
+        cause,
+        $metadata: { httpStatusCode: 403, requestId: "REQ-1" },
+      });
+    }
+
+    it("is the provider's own instance: name, message, stack, cause and extra fields intact", async () => {
+      const err = awsLikeError();
+      provider.presignError = err;
+      await expect(core.requestUpload("k", 1)).rejects.toBe(err);
+
+      const original = core.originalError as typeof err;
+      expect(original).toBe(err);
+      expect(original.name).toBe("AccessDenied");
+      expect(original.message).toBe("Access Denied");
+      expect(typeof original.stack).toBe("string");
+      expect(original.stack).toBe(err.stack);
+      expect(original.cause).toBe(err.cause);
+      expect(original.$metadata).toEqual({ httpStatusCode: 403, requestId: "REQ-1" });
+      // …while the published value stays the plain projection.
+      expect(core.error).toEqual({ name: "AccessDenied", message: "Access Denied" });
+    });
+
+    it("is readable from the Core's own s3-uploader:error listener, and clears with `error`", async () => {
+      const err = awsLikeError();
+      provider.presignError = err;
+      const seen: Array<{ detail: unknown; original: unknown }> = [];
+      core.addEventListener("s3-uploader:error", (e) => {
+        seen.push({ detail: (e as CustomEvent).detail, original: core.originalError });
+      });
+
+      await expect(core.requestUpload("k", 1)).rejects.toBe(err);
+      provider.presignError = null;
+      await core.requestUpload("k2", 1); // starts by clearing the slot
+
+      expect(seen).toEqual([
+        { detail: { name: "AccessDenied", message: "Access Denied" }, original: err },
+        { detail: null, original: null },
+      ]);
+      expect(core.error).toBeNull();
+      expect(core.originalError).toBeNull();
+    });
+
+    it("is the fatal registerPostProcess hook's own Error", async () => {
+      const hookErr = Object.assign(new Error("virus found"), { cause: { engine: "clamav" } });
+      core.registerPostProcess(() => { throw hookErr; });
+      await core.requestUpload("k", 1);
+      await expect(core.complete("k", "et")).rejects.toBe(hookErr);
+      expect(core.originalError).toBe(hookErr);
+      expect(core.error).toEqual({ name: "Error", message: "virus found" });
+    });
+
+    it("is not a declared wcBindable property, so RemoteShellProxy never reads or forwards it", () => {
+      const declared = [
+        ...S3Core.wcBindable.properties.map(p => p.name),
+        ...(S3Core.wcBindable.inputs ?? []).map(i => i.name),
+        ...(S3Core.wcBindable.commands ?? []).map(c => c.name),
+      ];
+      expect(declared).not.toContain("originalError");
+      expect(core.originalError).toBeNull();
     });
   });
 

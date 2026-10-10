@@ -4,7 +4,7 @@ import {
   S3ObjectMetadata, S3Progress, PostProcessHook, PostProcessContext, PostProcessOptions,
   MultipartInit, MultipartPartUrl, MultipartPart,
 } from "../types.js";
-import type { WcsS3AnyError, SerializedError } from "../types.js";
+import type { SerializedError } from "../types.js";
 import { normaliseError, toError, toSerializedError } from "../normaliseError.js";
 
 /** S3 minimum part size (5 MiB) — last part is exempt. */
@@ -170,11 +170,12 @@ export class S3Core extends EventTarget {
    */
   private _error: SerializedError | null = null;
   /**
-   * The normalised original behind `_error` — the provider's / hook's real
-   * `Error` instance (class, `stack`, extra fields) when the failure was
-   * one. In-process only; see `_localError`.
+   * The exception behind `_error` — the provider's / hook's own `Error`
+   * instance (class, `stack`, `cause`, extra fields), or the `Error` the
+   * Core rethrew in place of a non-`Error` rejection. In-process only; see
+   * `originalError`.
    */
-  private _errorSource: WcsS3AnyError = null;
+  private _errorSource: Error | null = null;
 
   private _flushScheduled: boolean = false;
   private _rafId: number | ReturnType<typeof setTimeout> | 0 = 0;
@@ -285,20 +286,44 @@ export class S3Core extends EventTarget {
    * for `sync`, and `@wc-bindable/remote` ≥ 0.10 rejects class instances
    * there regardless of `toJSON`. Returns a copy, like `metadata`, so a
    * caller mutating it cannot reach the internal slot. Server code that
-   * needs the original exception should take it from the rejected command
-   * promise.
+   * needs the original exception reads `originalError`.
    */
   get error(): SerializedError | null { return this._error ? { ...this._error } : null; }
 
   /**
-   * @internal — the normalised original behind `error` (the real `Error`
-   * instance, with class and `stack`, when the failure was one). Read only by
-   * an in-process Shell (`<s3-uploader>.attachLocalCore`) so its `error`
-   * keeps exposing the instance the way it did before `error` became a plain
-   * projection. Not a declared wcBindable property, so `RemoteShellProxy`
-   * never reads or forwards it.
+   * The exception behind `error`, as the Core caught it — for server-side
+   * logging and monitoring. It is the provider's or `registerPostProcess`
+   * hook's own `Error` instance, with its class, `stack`, `cause` and any
+   * extra fields (an AWS SDK `$metadata`, …) intact; for a rejection that
+   * was not an `Error`, it is the `Error` the Core rethrew in its place
+   * (same `name` / `message`, see `toError`). `null` exactly when `error` is
+   * `null`.
+   *
+   * It is set before the Core dispatches `s3-uploader:error`, so a listener
+   * on the Core (or on the `target` it was constructed with) can read it:
+   *
+   * ```ts
+   * core.addEventListener("s3-uploader:error", () => {
+   *   if (core.originalError) log.error(core.originalError);
+   * });
+   * ```
+   *
+   * This is what a remote setup needs: `RemoteShellProxy` catches a failed
+   * command's rejection itself and answers the client, so server code never
+   * sees it. Only failures the Core publishes on `error` appear here; an
+   * argument / state validation rejection (`raiseError` before any state
+   * change) or a superseded request leaves `error` — and this — untouched.
+   *
+   * Deliberately NOT a declared `wcBindable` property: `RemoteShellProxy`
+   * reads, forwards and accepts only what the declaration names, so this
+   * value never reaches a `sync`, an `update` or a command, and the browser
+   * keeps receiving the plain `{ name, message }` of `error`. (The failed
+   * command's own `throw` reply is unaffected: `RemoteShellProxy` builds it
+   * from the rethrown `Error` as before.) Returned as-is, not copied — it is
+   * the exception object itself. An in-process `<s3-uploader>`
+   * (`attachLocalCore`) reads it for its own `error`.
    */
-  get _localError(): WcsS3AnyError { return this._errorSource; }
+  get originalError(): Error | null { return this._errorSource; }
 
   // --- Post-process hook registration (server-side only API) ---
 
@@ -375,29 +400,26 @@ export class S3Core extends EventTarget {
   }
 
   private _setError(err: unknown): void {
-    // Route every thrown value through the shared normaliser so
-    // `_errorSource` never holds a bare string / nullish / arbitrary plain
-    // object — the declared type of the slot (`WcsS3AnyError`) is then an
-    // honest description of the runtime contents rather than a wishful cast.
-    // Providers that reject with bare strings, AWS-SDK-shaped payloads, or
-    // pre-serialised errors from another realm are projected onto the same
-    // `SerializedError` shape the Shell's `_setErrorState` consumes, so
-    // remote and local consumers see identical structure.
-    const normalised = normaliseError(err);
+    // `null` / `undefined` clears the slot. Anything else becomes a real
+    // `Error` — the same instance when it already is one (every caller
+    // passes the `Error` it is about to rethrow, so `originalError` and the
+    // command's rejection are one object) — so `_errorSource` never holds a
+    // bare string or an arbitrary plain object, and its `Error` type is an
+    // honest description of the runtime contents. A provider that rejects
+    // with a string or an AWS-SDK-shaped payload keeps its `name` /
+    // `message` (see `toError`).
+    const source = err == null ? null : toError(err);
 
     // Idempotent no-op when the error slot is already null and the caller
     // is clearing it again. Every `request*` / `deleteObject` entry calls
     // `_setError(null)` to discard a prior failure before the new attempt;
     // without this guard, a normal start-of-upload sequence dispatches a
     // spurious `s3-uploader:error` (detail=null) on every run, forcing
-    // every consumer to filter null detail values explicitly. Comparing
-    // both sides on `null` keeps the guard narrow — non-null clears (e.g.
-    // `_setError(undefined)` if a future caller writes that) still flow
-    // through normalisation. Skipping only the null→null transition also
-    // preserves the Shell's `_remoteValues.error != null` check, which
-    // already collapses "Core published null" and "Core never published"
-    // into the same branch.
-    if (normalised === null && this._error === null) return;
+    // every consumer to filter null detail values explicitly. Skipping only
+    // the null→null transition also preserves the Shell's
+    // `_remoteValues.error != null` check, which already collapses "Core
+    // published null" and "Core never published" into the same branch.
+    if (source === null && this._error === null) return;
 
     // Publish the plain `{ name, message }` projection, never the instance.
     // The `error` getter and this event's detail are both wire-visible
@@ -410,10 +432,11 @@ export class S3Core extends EventTarget {
     // saw no `s3-uploader:error` at all while the Shell deferred every
     // Core-side failure to this mirror, and since it dispatches failures it
     // did not see published it gets only the bare RPC rejection instead.
-    // The original value stays in `_errorSource` for in-process readers
-    // (`_localError`).
-    this._errorSource = normalised;
-    this._error = toSerializedError(normalised);
+    // The original stays in `_errorSource`, readable in-process through
+    // `originalError` — set before the dispatch, so a listener on the Core
+    // can already read it.
+    this._errorSource = source;
+    this._error = toSerializedError(source);
     this._target.dispatchEvent(new CustomEvent("s3-uploader:error", { detail: this.error, bubbles: true }));
   }
 

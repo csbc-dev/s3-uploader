@@ -368,6 +368,278 @@ describe("remote Shell — Core-published failures are still the mirror's single
   });
 });
 
+describe("remote Shell — only an `error` update applied after the connection's initial sync is a Core publish", () => {
+  // `_remoteErrorSeq` decides step 3 of `_setRpcErrorState` ("the Core
+  // already published this failure"). The `sync` snapshot — and any
+  // `update` that reaches the client before it — is Core state from before
+  // the producer processed anything this connection sent: the producer
+  // answers `sync` first, in order. An RPC the Shell sends before the
+  // snapshot arrives (the input `setWithAck`s of `_connectRemote`, an
+  // `upload()` started right after connecting — the proxy's default
+  // `preSyncBehavior: "eager"`) used to see a stale error in the snapshot as
+  // "the Core published", and a rejection the Core never published went
+  // unreported. Same rule as the Stripe Shell (`_observeSyncFrames`).
+
+  const STALE = { name: "Error", message: "earlier failure" };
+
+  /** A provider whose presign can be switched to fail. */
+  class SwitchableProvider extends TestProvider {
+    presignFailure: Error | null = null;
+    override async presignUpload(key: string, o: S3RequestOptions): Promise<PresignedUpload> {
+      if (this.presignFailure) throw this.presignFailure;
+      return super.presignUpload(key, o);
+    }
+  }
+
+  /**
+   * A Core that refuses some `bucket` values — the kind of input validation
+   * an app adds by subclassing. The setter throws before any state change,
+   * so the Core publishes nothing for it.
+   */
+  class BucketAllowlistCore extends S3Core {
+    override get bucket(): string { return super.bucket; }
+    override set bucket(value: string) {
+      if (value !== "b") throw new Error(`bucket "${value}" is not allowed`);
+      super.bucket = value;
+    }
+  }
+
+  /** Leave `core.error` set, as an earlier failed upload on the server would. */
+  async function primeStaleCoreError(core: S3Core, provider: SwitchableProvider): Promise<void> {
+    provider.presignFailure = new Error(STALE.message);
+    await core.requestUpload("stale", 1).catch(() => {});
+    provider.presignFailure = null;
+    expect(core.error).toEqual(STALE);
+  }
+
+  /**
+   * `pairedTransports` plus a log of the client's sends and receipts, so a
+   * test can show its RPC really went out before the `sync` response came
+   * back. `beforeSync` is pushed by the producer ahead of its `sync` answer.
+   */
+  function trackedTransports(beforeSync?: ServerMessage): {
+    client: ClientTransport; server: ServerTransport; order: string[];
+  } {
+    const pair = pairedTransports();
+    const order: string[] = [];
+    const client: ClientTransport = {
+      send: (m) => {
+        if (m.type !== "sync") order.push(`send:${m.type}:${(m as { name?: string }).name}`);
+        pair.client.send(m);
+      },
+      onMessage: (h) => pair.client.onMessage((m) => {
+        order.push(m.type === "update" ? `recv:update:${m.name}` : `recv:${m.type}`);
+        h(m);
+      }),
+    };
+    let injected = false;
+    const server: ServerTransport = {
+      send: (m) => {
+        if (beforeSync && m.type === "sync" && !injected) {
+          injected = true;
+          pair.server.send(beforeSync);
+        }
+        pair.server.send(m);
+      },
+      onMessage: (h) => pair.server.onMessage(h),
+    };
+    return { client, server, order };
+  }
+
+  function mountElement(attrs: Record<string, string> = {}): { el: S3; errors: unknown[] } {
+    const el = document.createElement("s3-uploader") as S3;
+    for (const [name, value] of Object.entries(attrs)) el.setAttribute(name, value);
+    const errors = recordErrors(el);
+    document.body.appendChild(el);
+    mounted.push(el);
+    return { el, errors };
+  }
+
+  function sentBeforeSync(order: string[], send: string): void {
+    expect(order).toContain(send);
+    expect(order.indexOf(send)).toBeLessThan(order.indexOf("recv:sync"));
+  }
+
+  it("a setWithAck sent before sync that the Core's input validation rejects is dispatched once", async () => {
+    const provider = new SwitchableProvider();
+    const core = new BucketAllowlistCore(provider);
+    core.bucket = "b";
+    await primeStaleCoreError(core, provider);
+    const { client, server, order } = trackedTransports();
+    new RemoteShellProxy(core, server);
+    const { el, errors } = mountElement({ bucket: "other-tenant" });
+
+    (el as any)._connectRemote(client);
+    await flushMany();
+
+    sentBeforeSync(order, "send:set:bucket");
+    expect(order).toContain("recv:throw");
+    // The snapshot's stale error is mirrored (it is the Core's state), and the
+    // rejection the Core never published is reported once on top of it.
+    expect(errors).toHaveLength(2);
+    expect(errors[0]).toEqual(STALE);
+    expect(errors[1]).toBeInstanceOf(Error);
+    expect((errors[1] as Error).message).toBe('bucket "other-tenant" is not allowed');
+    expect(el.error).toBe(errors[1]);
+    expect(core.bucket).toBe("b");
+    expect(core.error).toEqual(STALE);
+  });
+
+  it.each([
+    ["before", true],
+    ["after", false],
+  ] as const)("an upload() sent %s the sync that fails Core validation is dispatched once", async (_when, preSync) => {
+    const provider = new SwitchableProvider();
+    const core = new S3Core(provider);
+    core.bucket = "b";
+    await primeStaleCoreError(core, provider);
+    core.bucket = ""; // requestUpload now fails validation, publishing nothing
+    const { client, server, order } = trackedTransports();
+    new RemoteShellProxy(core, server);
+    const { el, errors } = mountElement();
+    el.file = new Blob(["x"]);
+
+    (el as any)._connectRemote(client);
+    if (!preSync) await flushMany();
+    const rejection = await rejectionOf(el.upload());
+    await flushMany();
+
+    if (preSync) sentBeforeSync(order, "send:cmd:requestUpload");
+    expect(rejection.message).toMatch(/bucket is required/);
+    expect(errors).toEqual([STALE, rejection]);
+    expect(errors[1]).toBe(rejection);
+    expect(el.error).toBe(rejection);
+    expect(core.error).toEqual(STALE);
+  });
+
+  it("an update the producer pushes before its sync answer does not count either", async () => {
+    const provider = new SwitchableProvider();
+    const core = new S3Core(provider);
+    core.bucket = "b";
+    await primeStaleCoreError(core, provider);
+    core.bucket = "";
+    const early = { name: "Error", message: "published before sync" };
+    const { client, server, order } = trackedTransports({ type: "update", name: "error", value: early });
+    new RemoteShellProxy(core, server);
+    const { el, errors } = mountElement();
+    el.file = new Blob(["x"]);
+
+    (el as any)._connectRemote(client);
+    const rejection = await rejectionOf(el.upload());
+    await flushMany();
+
+    sentBeforeSync(order, "send:cmd:requestUpload");
+    expect(order.indexOf("recv:update:error")).toBeLessThan(order.indexOf("recv:sync"));
+    expect(errors).toEqual([early, STALE, rejection]);
+    expect(el.error).toBe(rejection);
+  });
+
+  it("a Core-published failure of a pre-sync upload is still the mirror's single event", async () => {
+    const provider = new SwitchableProvider();
+    const core = new S3Core(provider);
+    core.bucket = "b";
+    await primeStaleCoreError(core, provider);
+    provider.presignFailure = new Error("denied now");
+    const { client, server, order } = trackedTransports();
+    new RemoteShellProxy(core, server);
+    const { el, errors } = mountElement();
+    el.file = new Blob(["x"]);
+
+    (el as any)._connectRemote(client);
+    const rejection = await rejectionOf(el.upload());
+    await flushMany();
+
+    sentBeforeSync(order, "send:cmd:requestUpload");
+    expect(rejection.message).toBe("denied now");
+    // The snapshot, then the Core's own publish — and nothing from the Shell.
+    expect(errors).toEqual([STALE, { name: "Error", message: "denied now" }]);
+    expect(errors[1]).not.toBeInstanceOf(Error);
+    expect(el.error).toEqual({ name: "Error", message: "denied now" });
+  });
+
+  it("a Core-published failure of a pre-sync setWithAck is still the mirror's single event", async () => {
+    // A subclass whose setter publishes before throwing (the Core's own
+    // `_setError` path): the publish arrives after the snapshot, so it counts.
+    class PublishingCore extends S3Core {
+      override get bucket(): string { return super.bucket; }
+      override set bucket(value: string) {
+        if (value !== "b") {
+          const err = new Error(`bucket "${value}" is not allowed`);
+          (this as unknown as { _setError(e: unknown): void })._setError(err);
+          throw err;
+        }
+        super.bucket = value;
+      }
+    }
+    const provider = new SwitchableProvider();
+    const core = new PublishingCore(provider);
+    core.bucket = "b";
+    await primeStaleCoreError(core, provider);
+    const { client, server, order } = trackedTransports();
+    new RemoteShellProxy(core, server);
+    const { el, errors } = mountElement({ bucket: "other-tenant" });
+
+    (el as any)._connectRemote(client);
+    await flushMany();
+
+    sentBeforeSync(order, "send:set:bucket");
+    expect(errors).toEqual([STALE, { name: "Error", message: 'bucket "other-tenant" is not allowed' }]);
+    expect(el.error).toEqual({ name: "Error", message: 'bucket "other-tenant" is not allowed' });
+  });
+
+  it("every connection starts unsynced: a reconnect's initial sync is not counted either", async () => {
+    // Connection 1, fully synced, then torn down by a DOM disconnect.
+    const first = pairedTransports();
+    new RemoteShellProxy(new S3Core(new TestProvider()), first.server);
+    const { el, errors } = mountElement();
+    (el as any)._connectRemote(first.client);
+    await flushMany();
+    el.remove();
+    document.body.appendChild(el);
+
+    // Connection 2: a Core holding a stale error; an upload sent before its
+    // sync fails validation.
+    const provider = new SwitchableProvider();
+    const core = new S3Core(provider);
+    core.bucket = "b";
+    await primeStaleCoreError(core, provider);
+    core.bucket = "";
+    const { client, server, order } = trackedTransports();
+    new RemoteShellProxy(core, server);
+    errors.length = 0;
+    el.file = new Blob(["x"]);
+
+    (el as any)._connectRemote(client);
+    const rejection = await rejectionOf(el.upload());
+    await flushMany();
+
+    sentBeforeSync(order, "send:cmd:requestUpload");
+    expect(errors).toEqual([STALE, rejection]);
+    expect(el.error).toBe(rejection);
+  });
+
+  it("the sync-observing transport wrapper still forwards onClose and dispose", async () => {
+    const pair = pairedTransports();
+    let closeHandler: (() => void) | null = null;
+    let disposed = 0;
+    const client: ClientTransport = {
+      send: (m) => pair.client.send(m),
+      onMessage: (h) => pair.client.onMessage(h),
+      onClose: (h) => { closeHandler = h; },
+      dispose: () => { disposed++; },
+    };
+    new RemoteShellProxy(new S3Core(new TestProvider()), pair.server);
+    const { el } = mountElement();
+
+    (el as any)._connectRemote(client);
+    await flushMany();
+    expect(typeof closeHandler).toBe("function");
+
+    el.remove(); // disconnectedCallback → _disposeRemote → proxy.dispose()
+    expect(disposed).toBe(1);
+  });
+});
+
 describe("Shell — one event per failed multipart run (no sticky suppression)", () => {
   it("remote: a second failed multipart run reports its own failure", async () => {
     const { client, server } = pairedTransports();

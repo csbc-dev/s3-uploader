@@ -36,6 +36,8 @@ interface Wire {
   server: ServerTransport;
   /** Every client → server message, as it crossed the wire. */
   sent: ClientMessage[];
+  /** Every server → client message, as it crossed the wire. */
+  received: ServerMessage[];
   /** Simulate the client side of the connection closing. */
   closeClient: () => void;
 }
@@ -45,6 +47,7 @@ function pairedTransports(): Wire {
   let serverHandler: ((m: ClientMessage) => void) | null = null;
   let clientClose: (() => void) | null = null;
   const sent: ClientMessage[] = [];
+  const received: ServerMessage[] = [];
   const client: ClientTransport = {
     send: (m) => {
       const frame = JSON.stringify(m);
@@ -57,11 +60,12 @@ function pairedTransports(): Wire {
   const server: ServerTransport = {
     send: (m) => {
       const frame = JSON.stringify(m);
+      received.push(JSON.parse(frame) as ServerMessage);
       queueMicrotask(() => clientHandler?.(JSON.parse(frame) as ServerMessage));
     },
     onMessage: (h) => { serverHandler = h; },
   };
-  return { client, server, sent, closeClient: () => clientClose?.() };
+  return { client, server, sent, received, closeClient: () => clientClose?.() };
 }
 
 /** Provider whose every method can be overridden per test. */
@@ -415,6 +419,135 @@ describe("S3 Shell over @wc-bindable/remote 0.10 — JsonValue gate regressions"
       expect(el.error).toBe(providerError);
       expect(errors).toEqual([providerError]);
       expect(core.error).toEqual({ name: "Error", message: "local denial" });
+    });
+  });
+
+  describe("S3Core.originalError — the original exception stays on the server", () => {
+    const DECLARED = S3Core.wcBindable.properties.map(p => p.name);
+
+    /** A provider error shaped like an AWS SDK one: a cause and an extra field. */
+    function awsLikeError(): Error & { cause: unknown; $metadata: { requestId: string } } {
+      return Object.assign(new Error("Access Denied"), {
+        name: "AccessDenied",
+        cause: new Error("socket hang up"),
+        $metadata: { requestId: "REQ-7f3a" },
+      });
+    }
+
+    /** `sync` / `update` frames: what carries property values to the browser. */
+    function propertyFrames(wire: Wire): ServerMessage[] {
+      return wire.received.filter(m => m.type === "sync" || m.type === "update");
+    }
+
+    it("server code reads the instance from the Core's error event; sync / update / throw never carry it", async () => {
+      const original = awsLikeError();
+      const provider = new TestProvider();
+      provider.presignUpload = async () => { throw original; };
+      const logged: unknown[] = [];
+      const { el, core, wire, errors, shellLogger } = await connect(provider, (c) => {
+        // The README recipe: log on the Core's own event, read the instance.
+        c.addEventListener("s3-uploader:error", () => {
+          if (c.originalError) logged.push(c.originalError);
+        });
+      });
+      el.file = new Blob(["x"]);
+
+      await expect(el.upload()).rejects.toThrow("Access Denied");
+      await flushMany();
+
+      // Server side: the provider's own instance, complete.
+      expect(logged).toEqual([original]);
+      expect(logged[0]).toBe(original);
+      const seen = core.originalError as ReturnType<typeof awsLikeError>;
+      expect(seen).toBe(original);
+      expect(seen.name).toBe("AccessDenied");
+      expect(seen.message).toBe("Access Denied");
+      expect(typeof seen.stack).toBe("string");
+      expect((seen.cause as Error).message).toBe("socket hang up");
+      expect(seen.$metadata).toEqual({ requestId: "REQ-7f3a" });
+
+      // Browser side: the plain projection, once.
+      expect(errors).toEqual([{ name: "AccessDenied", message: "Access Denied" }]);
+
+      // The wire. Property frames carry declared names only, and `error` as
+      // exactly `{ name, message }` — no stack, no cause, no extra field.
+      const props = propertyFrames(wire);
+      for (const m of props) {
+        if (m.type === "sync") {
+          for (const name of Object.keys(m.values)) expect(DECLARED).toContain(name);
+        } else if (m.type === "update") {
+          expect(DECLARED).toContain(m.name);
+        }
+      }
+      const errorUpdates = props.filter(m => m.type === "update" && m.name === "error" && m.value !== null);
+      expect(errorUpdates.map(m => (m as { value: unknown }).value)).toEqual([
+        { name: "AccessDenied", message: "Access Denied" },
+      ]);
+      const propText = JSON.stringify(props);
+      expect(propText).not.toContain("originalError");
+      expect(propText).not.toContain("socket hang up");
+      expect(propText).not.toContain("REQ-7f3a");
+      expect(propText).not.toContain("\"stack\"");
+      // The command's own `throw` envelope is what RemoteShellProxy builds
+      // from the rethrown Error (name / message / stack / code / a JSON-safe
+      // cause — upstream behaviour, unchanged here). The accessor adds nothing
+      // to it, and fields only the instance has never cross.
+      const throws = wire.received.filter(m => m.type === "throw");
+      expect(throws).toHaveLength(1);
+      const throwText = JSON.stringify(throws);
+      expect(throwText).not.toContain("originalError");
+      expect(throwText).not.toContain("$metadata");
+      expect(throwText).not.toContain("REQ-7f3a");
+      expect(shellLogger.warn).not.toHaveBeenCalled();
+    });
+
+    it("a client connecting after the failure gets the plain error in sync, not the instance", async () => {
+      const original = awsLikeError();
+      const provider = new TestProvider();
+      provider.presignUpload = async () => { throw original; };
+      const { core } = await connect(provider, async (c) => {
+        await c.requestUpload("k", 1).catch(() => {});
+      });
+      expect(core.originalError).toBe(original);
+
+      // A second connection to the same Core.
+      const wire2 = pairedTransports();
+      new RemoteShellProxy(core, wire2.server);
+      const el2 = document.createElement("s3-uploader") as S3;
+      document.body.appendChild(el2);
+      mounted.push(el2);
+      (el2 as any)._connectRemote(wire2.client);
+      await flushMany();
+
+      const sync = wire2.received.find(m => m.type === "sync") as Extract<ServerMessage, { type: "sync" }>;
+      expect(sync.values.error).toEqual({ name: "AccessDenied", message: "Access Denied" });
+      for (const name of Object.keys(sync.values)) expect(DECLARED).toContain(name);
+      const syncText = JSON.stringify(sync);
+      expect(syncText).not.toContain("originalError");
+      expect(syncText).not.toContain("socket hang up");
+      expect(syncText).not.toContain("REQ-7f3a");
+      expect(el2.error).toEqual({ name: "AccessDenied", message: "Access Denied" });
+    });
+
+    it("a client cannot ask for it: the producer refuses it as an undeclared command", async () => {
+      const original = awsLikeError();
+      const provider = new TestProvider();
+      provider.presignUpload = async () => { throw original; };
+      const { core, wire } = await connect(provider, async (c) => {
+        await c.requestUpload("k", 1).catch(() => {});
+      });
+
+      // A hand-written frame, as a hostile client would send it.
+      wire.client.send({ type: "cmd", name: "originalError", id: "probe", args: [] });
+      await flushMany();
+
+      const answer = wire.received.find(m => m.type === "throw" && m.id === "probe") as
+        Extract<ServerMessage, { type: "throw" }> | undefined;
+      expect(answer?.error).toMatchObject({ code: "WC_BINDABLE_UNDECLARED_COMMAND" });
+      const text = JSON.stringify(wire.received);
+      expect(text).not.toContain("socket hang up");
+      expect(text).not.toContain("REQ-7f3a");
+      expect(core.originalError).toBe(original);
     });
   });
 

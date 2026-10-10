@@ -76,7 +76,8 @@ const REMOTE_THROW_CODE = "WC_BINDABLE_REMOTE_THROW";
  * runs `_setError(e)` before rethrowing, but an argument / state validation
  * throw (`raiseError` before any state change: no bucket, key mismatch, no
  * active upload) and a superseded generation publish nothing.
- * `_setRpcErrorState` settles that case by observation (`_remoteErrorSeq`).
+ * `_setRpcErrorState` settles that case by observation
+ * (`_coreErrorPublishedSince`).
  */
 function isRemoteLayerFailure(error: unknown): boolean {
   const code = (error as { code?: unknown } | null | undefined)?.code;
@@ -86,21 +87,40 @@ function isRemoteLayerFailure(error: unknown): boolean {
 }
 
 /**
- * Where the Shell's two "this failure has already been reported" counters
- * stood when an operation began — see `_setRpcErrorState`.
+ * Per-connection state the Shell needs to tell the producer's `sync`
+ * snapshot apart from live `update` frames. Written by the transport
+ * wrapper `S3._observeSyncFrames`; read by the `bind()` mirror. (Same
+ * structure and names as the Stripe Shell's.)
  */
-interface ErrorWindow {
+interface RemoteSession {
+  /** True once the first `sync` response on this connection has been applied. */
+  synced: boolean;
+  /** True only while the proxy dispatches the values of a `sync` response. */
+  applyingSync: boolean;
+}
+
+/**
+ * Where `S3._remoteErrorSeq` stood when an RPC was sent, and on which
+ * connection. See `S3._coreErrorWindow` / `_coreErrorPublishedSince`.
+ */
+interface CoreErrorWindow {
+  readonly session: RemoteSession | null;
+  readonly coreErrors: number;
+}
+
+/**
+ * Where the Shell's two "this failure has already been reported" signals
+ * stood when an operation began — see `_setRpcErrorState`. The
+ * `CoreErrorWindow` part is the RPC's own; `connectionFailures` may be the
+ * whole upload run's (see `_errorWindow`).
+ */
+interface ErrorWindow extends CoreErrorWindow {
   /**
    * `S3._connectionFailureSeq` at the start of the upload run (or of a
    * standalone `setWithAck`): the WebSocket failure handler has reported a
    * drop since then iff the counter moved.
    */
   readonly connectionFailures: number;
-  /**
-   * `S3._remoteErrorSeq` when the RPC was sent: the Core's `bind()` mirror
-   * has delivered a failure since then iff the counter moved.
-   */
-  readonly coreErrors: number;
 }
 
 /**
@@ -176,20 +196,48 @@ export class S3 extends HTMLElement {
   private _errorState: S3ElementError = null;
   private _hasLocalError: boolean = false;
   /**
-   * Monotonic count of non-null `error` values the remote Core delivered
-   * through `bind()` — i.e. of `s3-uploader:error` events the mirror
-   * dispatched. An RPC snapshots it when sent (`ErrorWindow.coreErrors`), so
-   * on rejection `_setRpcErrorState` can tell "the Core already published
-   * this failure" (the counter moved: `RemoteShellProxy` forwards the
-   * `update` synchronously from `_setError`, ahead of the command's `throw`
-   * on the FIFO channel) from "the Core rejected without publishing" (it did
-   * not). Never reset — a reset could make a pre-reset publish look unseen.
+   * Monotonic count of non-null `error` values the remote Core PUBLISHED —
+   * i.e. delivered by an `update` frame after the current connection's
+   * initial `sync` snapshot was applied (see `_countsAsCorePublish`).
    *
-   * Stripe's Shell keeps a counter of the same name; unlike that one this
-   * counts only non-null values, because a `_setError(null)` reset at the
-   * start of a command is not a reported failure.
+   * An RPC snapshots it when sent (`_coreErrorWindow`), so on rejection
+   * `_coreErrorPublishedSince` lets `_setRpcErrorState` tell "the Core
+   * already published this failure" (the counter moved on the same
+   * connection: `RemoteShellProxy` forwards the `update` synchronously from
+   * `_setError`, ahead of the command's `throw` on the FIFO channel) from
+   * "the Core rejected without publishing" (it did not).
+   *
+   * What is NOT counted, and why (same rule as the Stripe Shell's counter):
+   * - `null`. The Core clears its slot (`_setError(null)`) at the start of a
+   *   command; that is not a reported failure.
+   * - The `sync` snapshot, and any `update` that arrives before it. Both
+   *   describe Core state from BEFORE the producer processed anything this
+   *   connection sent (the producer answers `sync` first, in order), so an
+   *   error they carry is stale for every RPC of this connection —
+   *   including one sent before the snapshot arrived: the input
+   *   `setWithAck`s of `_connectRemote`, or an `upload()` started right
+   *   after connecting (the pre-sync window, see `_observeSyncFrames`).
+   *   Counting them made a stale error look like this RPC's publish, and a
+   *   Core validation rejection — which publishes nothing — went unreported.
+   *
+   * Never reset: a reset could make a pre-reset publish look unseen to a
+   * window taken before it. Windows are scoped to their `RemoteSession`
+   * instead, so a publish on one connection never pairs with an RPC of
+   * another (`_endRemoteSession`).
+   *
+   * The bind mirror still dispatches every non-null delivery — snapshot
+   * included — as `s3-uploader:error`; this counter only decides whether the
+   * Shell adds a dispatch of its own for a rejected RPC.
    */
   private _remoteErrorSeq: number = 0;
+  /**
+   * Sync bookkeeping for the current remote connection; `null` while no
+   * proxy is attached. Replaced (never reused) by every `_connectRemote`,
+   * so a late frame from a torn-down transport cannot mark the new
+   * connection synced, and a window taken on one connection never matches
+   * an error published on the next.
+   */
+  private _remoteSession: RemoteSession | null = null;
   /**
    * Monotonic count of WebSocket failures the `onFail` handler reported.
    * Everything an in-flight upload run or `setWithAck` fails with after
@@ -309,6 +357,7 @@ export class S3 extends HTMLElement {
       this._proxy = null;
     }
     this._remoteValues = {};
+    this._endRemoteSession();
     if (this._ws) {
       const ws = this._ws;
       this._ws = null;
@@ -377,7 +426,7 @@ export class S3 extends HTMLElement {
   }
 
   /**
-   * Snapshot the "already reported" counters for an operation starting now.
+   * Snapshot the "already reported" signals for an operation starting now.
    * Pass the upload run's own window as `run` for an RPC inside that run, so
    * a WebSocket drop is matched against the whole run (every later failure
    * of the run is its consequence) while a Core publish is matched against
@@ -386,8 +435,96 @@ export class S3 extends HTMLElement {
   private _errorWindow(run?: ErrorWindow): ErrorWindow {
     return {
       connectionFailures: run ? run.connectionFailures : this._connectionFailureSeq,
-      coreErrors: this._remoteErrorSeq,
+      ...this._coreErrorWindow(),
     };
+  }
+
+  /**
+   * Wrap a client transport so the Shell can see which frames are the
+   * producer's `sync` snapshot. The proxy dispatches a `sync` response's
+   * values synchronously inside the handler call, so flagging the session
+   * around that one call marks exactly those `bind()` deliveries.
+   *
+   * Why the Shell needs to know: an `error` value carried by `sync` is the
+   * Core's state from before the producer processed anything this
+   * connection sent. With the proxy's default (eager) pre-sync behavior the
+   * input `setWithAck`s `_connectRemote` sends, and an `upload()` started
+   * right after connecting, go out BEFORE the snapshot arrives, yet the
+   * producer still answers `sync` first; under `preSyncBehavior: "queue"`
+   * they are sent right after the snapshot is applied. Either way the moment
+   * a command's Core publishes can start is "after the snapshot", which is
+   * what `_countsAsCorePublish` encodes. (Same wrapper as the Stripe
+   * Shell's.)
+   *
+   * Transparent otherwise: `send` / `onClose` / `dispose` delegate as
+   * method calls (so `this` binding inside the transport is preserved).
+   */
+  private _observeSyncFrames(transport: ClientTransport, session: RemoteSession): ClientTransport {
+    const observed: ClientTransport = {
+      send: (message) => transport.send(message),
+      onMessage: (handler) => transport.onMessage((message) => {
+        if (message.type !== "sync") {
+          handler(message);
+          return;
+        }
+        session.applyingSync = true;
+        try {
+          handler(message);
+        } finally {
+          session.applyingSync = false;
+          session.synced = true;
+        }
+      }),
+    };
+    if (typeof transport.onClose === "function") {
+      observed.onClose = (handler) => transport.onClose!(handler);
+    }
+    if (typeof transport.dispose === "function") {
+      observed.dispose = () => transport.dispose!();
+    }
+    return observed;
+  }
+
+  /**
+   * True when an `error` delivery on `session` is a Core publish that
+   * `_remoteErrorSeq` counts: a live `update` frame on the current
+   * connection, after its `sync` snapshot was applied.
+   */
+  private _countsAsCorePublish(session: RemoteSession): boolean {
+    return session === this._remoteSession && session.synced && !session.applyingSync;
+  }
+
+  /**
+   * Snapshot taken when an RPC is sent (see `_remoteErrorSeq`). With an
+   * in-process Core there is no `bind()` mirror; the window then has no
+   * session and `_coreErrorPublishedSince` always answers `false`.
+   */
+  private _coreErrorWindow(): CoreErrorWindow {
+    return { session: this._remoteSession, coreErrors: this._remoteErrorSeq };
+  }
+
+  /**
+   * Whether the remote Core published an `error` on the same connection
+   * after `since` was taken. Neither the `sync` snapshot nor an error that
+   * was already there when the RPC was sent counts (see `_remoteErrorSeq`).
+   * If the connection was torn down or replaced in between, the answer is
+   * `false`: whatever the old Core published can no longer be paired with
+   * the call. (The Stripe Shell's method of the same name returns the
+   * published error, whose `code` it needs; this Shell only needs to know
+   * whether there was one.)
+   */
+  private _coreErrorPublishedSince(since: CoreErrorWindow): boolean {
+    if (since.session === null || since.session !== this._remoteSession) return false;
+    return this._remoteErrorSeq !== since.coreErrors;
+  }
+
+  /**
+   * Close the books on the current remote connection. The counter itself
+   * stays monotonic; dropping the session is what keeps a window taken on
+   * this connection from pairing with a publish on the next one.
+   */
+  private _endRemoteSession(): void {
+    this._remoteSession = null;
   }
 
   /** @internal — visible for testing */
@@ -402,18 +539,24 @@ export class S3 extends HTMLElement {
     if (this._core) {
       throw new Error("[@csbc-dev/s3-uploader] _connectRemote() called while a local Core is already attached. Call disconnectedCallback / detach first.");
     }
-    this._proxy = createRemoteCoreProxy(S3Core.wcBindable, transport);
+    // Fresh per connection (see `_remoteSession`). Assigned after the proxy
+    // so a throwing `createRemoteCoreProxy` (its initial `sync` send can
+    // fail) leaves neither field set.
+    const session: RemoteSession = { synced: false, applyingSync: false };
+    this._proxy = createRemoteCoreProxy(S3Core.wcBindable, this._observeSyncFrames(transport, session));
+    this._remoteSession = session;
     this._unbind = bind(this._proxy, (name, value) => {
       this._remoteValues[name] = value;
       if (name === "error" && value != null) {
-        // The Core reported a failure. Count it (see `_remoteErrorSeq`), and
-        // let it supersede an older local error so `el.error` agrees with
-        // the event dispatched below — otherwise the getter's
-        // `_hasLocalError` branch would keep returning, say, the previous
-        // run's PUT failure. A `null` publish (the Core clearing its slot as
-        // a command starts) leaves the local layer alone. Same rule as the
-        // Stripe Shell's mirror.
-        this._remoteErrorSeq++;
+        // Count a Core publish (see `_remoteErrorSeq` for what is left out:
+        // `null`, the `sync` snapshot, frames before it).
+        if (this._countsAsCorePublish(session)) this._remoteErrorSeq++;
+        // A non-null remote error — published or synced — supersedes an
+        // older local error so `el.error` agrees with the event dispatched
+        // below; otherwise the getter's `_hasLocalError` branch would keep
+        // returning, say, the previous run's PUT failure. A `null` delivery
+        // (the Core clearing its slot as a command starts) leaves the local
+        // layer alone. Same rule as the Stripe Shell's mirror.
         this._hasLocalError = false;
         this._errorState = null;
       }
@@ -435,10 +578,15 @@ export class S3 extends HTMLElement {
     // before `_proxy` exists (during upgrade), so the empty-string sync
     // must happen here or not at all.
     //
-    // These acks are queued until the first `sync`, so a socket that never
-    // opens rejects all of them with `WC_BINDABLE_DISPOSED` right after
-    // `onFail` reported the failed connection — `_setRpcErrorState` (not
-    // `_setErrorState`) keeps that to the one event.
+    // These acks go out before the `sync` response arrives (the proxy's
+    // default eager pre-sync behavior; the WebSocket transport holds them
+    // until the socket opens), so a socket that never opens rejects all of
+    // them with `WC_BINDABLE_DISPOSED` right after `onFail` reported the
+    // failed connection — `_setRpcErrorState` (not `_setErrorState`) keeps
+    // that to the one event. Being pre-sync is also why a stale `error` in
+    // the snapshot must not count as their Core publish: a Core subclass
+    // whose input setter refuses the value publishes nothing, and its
+    // rejection must still be dispatched (see `_remoteErrorSeq`).
     const since = this._errorWindow();
     if (this.hasAttribute("bucket")) {
       this._proxy!.setWithAck("bucket", this.bucket).catch((e: unknown) => this._setRpcErrorState(e, since));
@@ -621,11 +769,12 @@ export class S3 extends HTMLElement {
         ? (this._remoteValues.error as S3ElementError)
         : this._errorState;
     }
-    // In-process Core: read the original value (`_localError`), not the
-    // plain `{ name, message }` projection `core.error` publishes for the
-    // wire, so a local element keeps exposing the real `Error` instance
-    // (class, `stack`) exactly as it did before the projection existed.
-    return this._core?._localError ?? this._errorState;
+    // In-process Core: read the original exception (`core.originalError`),
+    // not the plain `{ name, message }` projection `core.error` publishes
+    // for the wire, so a local element keeps exposing the real `Error`
+    // instance (class, `stack`) exactly as it did before the projection
+    // existed.
+    return this._core?.originalError ?? this._errorState;
   }
 
   // --- Trigger ---
@@ -942,16 +1091,22 @@ export class S3 extends HTMLElement {
    *    rethrowing, and `RemoteShellProxy` forwards that `update` the moment
    *    it is dispatched — ahead of the command's `throw` on the FIFO
    *    channel — so the mirror has dispatched it before this catch runs:
-   *    `_remoteErrorSeq` moved since the RPC was sent → stay silent
-   *    (dispatching again broke the one-failure-one-event contract).
-   * 4. The counter did not move: the Core rejected without publishing — an
+   *    the Core published a non-null `error` on this connection since the
+   *    RPC was sent (`_coreErrorPublishedSince`) → stay silent (dispatching
+   *    again broke the one-failure-one-event contract). Only an `update`
+   *    applied after the connection's initial `sync` counts: the snapshot,
+   *    and anything before it, predates every RPC of the connection — an
+   *    RPC sent before the snapshot arrived included (see `_remoteErrorSeq`).
+   * 4. Nothing was published: the Core rejected without publishing — an
    *    argument / state validation throw (`raiseError`: no bucket, key
-   *    mismatch, no active upload) or a superseded generation → dispatch.
+   *    mismatch, no active upload; a Core subclass's input setter refusing
+   *    a `setWithAck` value) or a superseded generation → dispatch.
    *    Deferring to the mirror here is what used to make these failures as
-   *    silent as step 2 describes.
+   *    silent as step 2 describes — and so did counting a stale error that
+   *    the initial `sync` delivered after a pre-sync RPC was sent.
    *
-   * With an in-process Core neither counter moves during an operation (there
-   * is no `bind()` mirror and no WebSocket), so every failure is dispatched
+   * With an in-process Core there is no `bind()` mirror, no session and no
+   * WebSocket, so steps 1 and 3 never apply and every failure is dispatched
    * here, as it always was.
    *
    * Local-failure paths (`_putBlob`, `_putPart`, the aborted-multipart
@@ -960,7 +1115,7 @@ export class S3 extends HTMLElement {
    */
   private _setRpcErrorState(error: unknown, since: ErrorWindow): void {
     if (this._connectionFailureSeq !== since.connectionFailures) return;
-    if (!isRemoteLayerFailure(error) && this._remoteErrorSeq !== since.coreErrors) return;
+    if (!isRemoteLayerFailure(error) && this._coreErrorPublishedSince(since)) return;
     this._setErrorState(error);
   }
 
