@@ -161,7 +161,7 @@ describe("S3Core multipart", () => {
     expect(core.uploading).toBe(false);
     // `error` publishes the plain wire projection; the instance stays local.
     expect(core.error).toEqual({ name: "Error", message: "merge failed" });
-    expect(core._localError).toBe(provider.completeError);
+    expect(core.originalError).toBe(provider.completeError);
   });
 
   it("completeMultipart refuses key/uploadId mismatch", async () => {

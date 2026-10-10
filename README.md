@@ -78,6 +78,13 @@ wss.on("connection", (ws) => {
     await db.insertAsset({ key, etag, size });
   });
 
+  // Log failures with the original exception (class, stack, cause, extra
+  // fields). The browser only gets `core.error`'s plain { name, message };
+  // `core.originalError` is not part of the wire contract and stays here.
+  core.addEventListener("s3-uploader:error", () => {
+    if (core.originalError) logger.error(core.originalError);
+  });
+
   // Adapter elided — see the ws ⇆ ServerTransport sample in examples/s3-remote/.
   new RemoteShellProxy(core, makeTransport(ws));
 
@@ -259,7 +266,8 @@ coercing it the way `JSON.stringify` used to:
   the browser-side proxy before sending (`WC_BINDABLE_INVALID_JSON_VALUE`).
 
 `S3Core` and `<s3-uploader>` keep their own traffic inside that contract:
-`error` is published as a plain `{ name, message }`, `metadata` omits a
+`error` is published as a plain `{ name, message }` (the exception itself
+stays on the server as `core.originalError`), `metadata` omits a
 missing `size` / `contentType` instead of carrying `undefined`, the Shell
 omits an unset trailing argument (e.g. the content type of a type-less
 `File`), and the Core drops `undefined` members (including `undefined`
@@ -803,10 +811,34 @@ WebSocket-failure event for the drop that caused it.
 `S3Core.error` itself (what server-side code reads, and the `detail` of the
 Core's own `s3-uploader:error`) is always the plain `{ name, message }`
 object. `stack` is withheld from it because the browser is an untrusted
-boundary. To log the original exception (class, `stack`, extra fields) on
-the server, catch it where it is raised — in your `IS3Provider` wrapper or
-`registerPostProcess` hook — or, when you call Core commands directly, from
-the rejected promise.
+boundary.
+
+To log or monitor the original exception on the server, read
+**`core.originalError`**. In a remote setup this is the only way to get it:
+`RemoteShellProxy` catches the failed command's rejection and answers the
+browser itself, so your code never sees that promise.
+
+- It is the provider's or `registerPostProcess` hook's own `Error` instance,
+  with its class, `stack`, `cause` and extra fields (an AWS SDK `$metadata`,
+  …). A rejection that was not an `Error` is the `Error` the Core rethrew in
+  its place, with the same `name` / `message`.
+- It changes together with `error`: it is set before the Core dispatches
+  `s3-uploader:error`, and it is `null` whenever `error` is. Listen on the
+  Core (or on the `target` you constructed it with) and read it there, as in
+  the [server Quick Start](#1-server-node).
+- It covers the failures the Core publishes on `error`, the first row of the
+  table above. Validation rejections that publish nothing (`bucket is
+  required`, a key mismatch, a superseded request) do not appear here. They
+  are caused by the request itself and reach the browser as the rejection.
+- It is **not** declared in `S3Core.wcBindable`. `RemoteShellProxy` reads,
+  forwards and accepts only declared names, so this value is never sent in a
+  `sync` or an `update` and cannot be invoked or set. The failed command's
+  own `throw` reply is unchanged: `RemoteShellProxy` still builds it from
+  the rethrown `Error` (the last column of the table), and that envelope
+  includes `stack` and a JSON-safe `cause`.
+
+When you call Core commands directly (no remote layer), the rejected promise
+carries the same instance.
 
 > **Breaking change (`@wc-bindable/remote` 0.10 upgrade).** `S3Core.error` and
 > the `detail` of the Core's own `s3-uploader:error` used to be the thrown
@@ -814,7 +846,8 @@ the rejected promise.
 > the plain `{ name, message }` object, and a provider / hook rejection that
 > is not an `Error` is rethrown as an `Error` with the same `name` /
 > `message`. Server code that checks `core.error instanceof Error` or reads
-> `core.error.stack` must change. A browser-side `<s3-uploader>` is
+> `core.error.stack` must change: read `core.originalError` for the
+> instance. A browser-side `<s3-uploader>` is
 > unaffected in shape: a remote one always received plain objects for
 > Core-side failures (now without `stack`), and one with an in-process Core
 > still exposes the original instance.

@@ -1,13 +1,14 @@
 import type { SerializedError, WcsS3AnyError } from "./types.js";
 
 /**
- * Normalise any thrown value to the `WcsS3AnyError` union kept in the error
- * slots (`S3Core._errorSource`, `S3._errorState`).
- * Single choke-point shared by the Core (`S3Core._setError`) and the Shell
- * (`S3._setErrorState`) so remote and local consumers see identical
- * structure for any rejection — whether the provider threw an `Error`
- * instance, a bare string, a pre-serialised plain object from another realm,
- * or an AWS-SDK-shaped payload.
+ * Normalise any thrown value to the `WcsS3AnyError` union kept in the
+ * Shell's error slot (`S3._errorState`); the Core's slot
+ * (`S3Core._errorSource`) goes through `toError`, which builds on this.
+ * Single choke-point shared by the Core and the Shell (`S3._setErrorState`)
+ * so remote and local consumers see identical structure for any
+ * rejection — whether the provider threw an `Error` instance, a bare string,
+ * a pre-serialised plain object from another realm, or an AWS-SDK-shaped
+ * payload.
  *
  * The returned value always satisfies `WcsS3AnyError`:
  *   - `null` / `undefined` collapses to `null`
@@ -84,7 +85,8 @@ export function toError(err: unknown): Error {
  * `cause`") says producers SHOULD omit `stack` there by default — a
  * server-side trace exposes internal paths and dependency layout to every
  * bound client. The original value (with `stack`, class and extra fields)
- * stays in-process, readable by the local Shell (`S3Core._localError`).
+ * stays in-process, readable through `S3Core.originalError` (server code,
+ * and an in-process `<s3-uploader>`).
  */
 export function toSerializedError(err: WcsS3AnyError): SerializedError | null {
   if (err == null) return null;
