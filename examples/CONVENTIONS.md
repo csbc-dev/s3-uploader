@@ -70,8 +70,11 @@ Matching webauthn: the three Vite clients are **built**, and the shared
 - Every example depends on the package as `"@csbc-dev/s3-uploader": "file:../.."`.
   The package must be built once from the repo root (`npm install && npm run
   build`) so `dist/` exists before any client resolves the dependency.
-- The `@wc-bindable/*` adapters are pinned at `^0.7.0`. `@wcstack/state` is
-  **not** a dependency — `wcstack-state` loads it from a CDN (see §6).
+- The `@wc-bindable/*` adapters are pinned at `^0.10.0` — the same minor as
+  the package's own `@wc-bindable/core` / `@wc-bindable/remote` dependency.
+  `remote` 0.10 changed the wire contract (strict JsonValue), so the server's
+  `RemoteShellProxy` must not drift from it. `@wcstack/state` is **not** a
+  dependency — `wcstack-state` loads it from a CDN (see §6).
 - The server uses `@csbc-dev/s3-uploader/server` (the Node-safe barrel), never
   the default browser barrel — the latter pulls in `HTMLElement`-based code and
   fails to evaluate under Node.

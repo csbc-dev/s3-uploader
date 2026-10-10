@@ -1,4 +1,4 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   createRemoteCoreProxy,
   RemoteShellProxy,
@@ -7,6 +7,7 @@ import {
   type ClientMessage,
   type ServerMessage,
 } from "@wc-bindable/remote";
+import { bind } from "@wc-bindable/core";
 import { S3Core } from "../src/core/S3Core";
 import {
   IS3Provider, S3RequestOptions, PresignedUpload, PresignedDownload,
@@ -128,9 +129,18 @@ describe("multipart headers round-trip through the remote proxy", () => {
     const { client, server } = pairedTransports();
     const core = new S3Core(new HeaderProvider());
     core.bucket = "b";
-    new RemoteShellProxy(core, server);
+    // No contentType argument: the Core's metadata must omit the key rather
+    // than carry `contentType: undefined`, which @wc-bindable/remote ≥ 0.10
+    // rejects — the producer would log "dropped update for metadata" and
+    // the client would never see the value.
+    const logger = { warn: vi.fn(), error: vi.fn() };
+    new RemoteShellProxy(core, server, { logger });
 
     const proxy = createRemoteCoreProxy(S3Core.wcBindable, client);
+    const metadata: unknown[] = [];
+    const unbind = bind(proxy, (name, value) => {
+      if (name === "metadata" && value != null) metadata.push(value);
+    });
     await proxy.invokeWithOptions(
       "requestMultipartUpload",
       ["remote-big.bin", 20 * MIB],
@@ -146,7 +156,10 @@ describe("multipart headers round-trip through the remote proxy", () => {
     expect(refreshed.headers?.["x-amz-server-side-encryption-customer-algorithm"]).toBe("AES256");
     expect(refreshed.headers?.["x-amz-server-side-encryption-customer-key-md5"])
       .toBe("md5-mp-remote-1-2");
+    expect(metadata).toEqual([{ size: 20 * MIB }]);
+    expect(logger.warn).not.toHaveBeenCalled();
 
+    unbind();
     proxy.dispose();
   });
 });

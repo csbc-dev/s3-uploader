@@ -179,7 +179,7 @@ today without forking:
 
 | What you want to reject / enforce | Where to hook |
 |---|---|
-| Bucket / prefix / key / size / content-type before any URL is minted | Wrap `IS3Provider` and throw from `presignUpload` / `initiateMultipart`. The Core surfaces the throw as `s3-uploader:error` and leaves no S3 state behind. |
+| Bucket / prefix / key / size / content-type before any URL is minted | Wrap `IS3Provider` and throw from `presignUpload` / `initiateMultipart`. The Core publishes the throw on its `error` property (the browser receives one `s3-uploader:error` with `{ name, message }` — see [Error types](#error-types)) and leaves no S3 state behind. |
 | Post-upload checks (virus scan, DB insert, allowlist) | `core.registerPostProcess(ctx => …)`. Throwing here rejects the upload — see "Post-process failure semantics" below. |
 
 A dedicated `registerValidate` hook running **before** presign (so it can reject
@@ -230,9 +230,52 @@ class ContentTypeAllowlist implements IS3Provider {
 const core = new S3Core(new ContentTypeAllowlist(new AwsS3Provider()));
 ```
 
-The throw surfaces as `s3-uploader:error` on the Shell, no presigned URL is minted,
-and S3 sees nothing. Use the same shape for max-size / key-shape / per-tenant
-checks.
+The throw surfaces as one `s3-uploader:error` on the Shell — detail
+`{ name: "Error", message: "[upload] content-type not allowed: …" }`, a plain
+object rather than the `Error` you threw (see
+[how errors cross the wire](#how-errors-cross-the-remote-boundary)) — no
+presigned URL is minted, and S3 sees nothing. Use the same shape for
+max-size / key-shape / per-tenant checks.
+
+> Note that `opts.contentType` is `undefined` whenever the element has no
+> `content-type` attribute and the picked `File` has an empty `type` (the
+> browser leaves it empty for unrecognised extensions), so an allowlist like
+> the one above rejects such files — decide explicitly whether that is what
+> you want.
+
+## Remote wire values (`@wc-bindable/remote` ≥ 0.10)
+
+Since 0.10, `@wc-bindable/remote` transmits only strict JSON values
+(`JsonValue`) in both directions and rejects everything else instead of
+coercing it the way `JSON.stringify` used to:
+
+- **An object member whose value is `undefined` rejects the whole value** —
+  it is not dropped. So do `NaN` / `Infinity`, `Date`, `Map` / `Set`, and any
+  class instance including `Error` (a `toJSON` method does not help).
+- A rejected **property value** is dropped by `RemoteShellProxy` with a
+  server-side warning (`dropped update for "…"`); the browser keeps its last
+  value. A rejected **command result** rejects the RPC with
+  `WC_BINDABLE_INVALID_RETURN_VALUE`. A rejected **argument** is refused by
+  the browser-side proxy before sending (`WC_BINDABLE_INVALID_JSON_VALUE`).
+
+`S3Core` and `<s3-uploader>` keep their own traffic inside that contract:
+`error` is published as a plain `{ name, message }`, `metadata` omits a
+missing `size` / `contentType` instead of carrying `undefined`, the Shell
+omits an unset trailing argument (e.g. the content type of a type-less
+`File`), and the Core drops `undefined` members (including `undefined`
+header values) from the `PresignedUpload` / `PresignedDownload` your
+provider returns. What the Core cannot fix is a provider or wrapper that
+returns other non-JSON values — e.g. a `Date` as `expiresAt` (it must be a
+number, epoch ms) — or a `registerPostProcess` / provider code path that
+relies on a class-instance error reaching the browser. Those now fail
+loudly: the RPC rejects with the code above and the Shell dispatches it as
+`s3-uploader:error`.
+
+Keep `@wc-bindable/remote` on `^0.10` on both ends, together with this
+package. Your server constructs `RemoteShellProxy` from **its own**
+dependency, so upgrading only that to 0.10 applies these rules to an older
+`@csbc-dev/s3-uploader` — the combination that silently loses Core-side
+errors and `metadata`.
 
 ## Component API
 
@@ -278,7 +321,7 @@ then read it as state to get the resolved key emitted by the Core (`s3-uploader:
 | `loading` | `s3-uploader:loading-changed` | true during signing/uploading |
 | `uploading` | `s3-uploader:uploading-changed` | true during the actual PUT(s) |
 | `completed` | `s3-uploader:completed-changed` | true after post-process succeeds |
-| `metadata` | `s3-uploader:metadata-changed` | `{ size, contentType }` |
+| `metadata` | `s3-uploader:metadata-changed` | `{ size?, contentType? }` — a member is omitted (not `undefined`) when unknown, e.g. `contentType` for a `File` with no `type` and no `content-type` attribute |
 | `error` | `s3-uploader:error` | `null` between uploads, error object on failure |
 
 ### `<s3-callback>`
@@ -606,7 +649,7 @@ When a `registerPostProcess` hook throws, the contract is:
 | S3 object | **retained** (the bytes are already in the bucket at that point) |
 | `completed` | stays `false` |
 | `uploading`, `loading` | set to `false` |
-| `error` | populated with the thrown error; `s3-uploader:error` dispatched |
+| `error` | populated with `{ name, message }` of the thrown error; `s3-uploader:error` dispatched (once, on a remote Shell too) |
 | `url` | **not** published (no presigned GET minted) |
 | the `complete` / `completeMultipart` RPC | rejects with the same error |
 
@@ -663,7 +706,10 @@ database. The supported patterns are:
 ## Error types
 
 Errors surfaced through `s3-uploader:error` (and the `error` property) come from
-two distinct layers, and the package treats them differently.
+two distinct layers, and the package treats them differently. Where an error
+was raised — browser or server — also decides what shape it has when it
+reaches a remote `<s3-uploader>`; see
+[How errors cross the remote boundary](#how-errors-cross-the-remote-boundary).
 
 ### Package-owned errors — discriminated union
 
@@ -714,8 +760,10 @@ than silently changing behavior at runtime.
 
 Errors **not** owned by this package — `AccessDenied`, `NoSuchBucket`,
 `InvalidPart`, CORS preflight rejections, the underlying transport's
-network errors — surface as plain `Error` instances with the upstream
-message preserved. **They are not members of `S3OwnedError`** and are
+network errors — are passed through with the upstream `name` and `message`
+preserved (an `<s3-uploader>` with an in-process Core exposes the original
+`Error` instance; over the remote boundary they arrive as plain objects —
+see below). **They are not members of `S3OwnedError`** and are
 deliberately not wrapped:
 
 - `AwsS3Provider` already produces messages that discriminate the SDK error
@@ -727,10 +775,41 @@ deliberately not wrapped:
   re-discriminate by message anyway.
 
 If you need code-level discrimination on upstream cases, do it where the
-vocabulary is stable: in your wrapped `IS3Provider`, throw your own typed
-errors at the boundary you control. Those will then surface through
-`s3-uploader:error` with their original class intact, and you can extend your
-own discriminated union alongside `S3OwnedError`.
+vocabulary is stable: in your wrapped `IS3Provider`, throw your own errors at
+the boundary you control and give each a distinctive **`name`**. The `name`
+is what survives the wire: a remote `<s3-uploader>` receives
+`{ name, message }`, not your class, so discriminate with
+`err.name === "QuotaExceeded"` rather than `instanceof` (the class only
+survives with an in-process Core). A provider that rejects with a plain
+object or a string is turned into an `Error` with the same `name` /
+`message` before it is rethrown.
+
+### How errors cross the remote boundary
+
+| failure | `s3-uploader:error` detail / `el.error` on a remote `<s3-uploader>` | `upload()` rejects with |
+|---|---|---|
+| inside the Core — provider rejection, fatal `registerPostProcess` hook, `completeMultipart` failure | plain `{ name, message }`, mirrored from `S3Core.error` (no class, no `stack`, no extra fields) — dispatched **once** | the `Error` that `RemoteCoreProxy` rebuilds from the throw envelope (`name`, `message`, a string `code` when the error had one, and whatever `stack` the server's `RemoteShellProxy` sends) |
+| in the browser — `PutHttpError`, `MissingEtagError` | the real `Error` instance, dispatched by the Shell | the same instance |
+| in the remote layer, outside any Core command — `WC_BINDABLE_TIMEOUT`, `_DISPOSED`, `_TERMINAL_FAILURE`, `_INVALID_JSON_VALUE`, `_INVALID_RETURN_VALUE`, … | the `Error` from `@wc-bindable/remote`, with its `code` — dispatched by the Shell | the same instance |
+
+`S3Core.error` itself (what server-side code reads, and the `detail` of the
+Core's own `s3-uploader:error`) is always the plain `{ name, message }`
+object. `stack` is withheld from it because the browser is an untrusted
+boundary. To log the original exception (class, `stack`, extra fields) on
+the server, catch it where it is raised — in your `IS3Provider` wrapper or
+`registerPostProcess` hook — or, when you call Core commands directly, from
+the rejected promise.
+
+> **Breaking change (`@wc-bindable/remote` 0.10 upgrade).** `S3Core.error` and
+> the `detail` of the Core's own `s3-uploader:error` used to be the thrown
+> `Error` instance (with a `toJSON` patch for the wire); they are now always
+> the plain `{ name, message }` object, and a provider / hook rejection that
+> is not an `Error` is rethrown as an `Error` with the same `name` /
+> `message`. Server code that checks `core.error instanceof Error` or reads
+> `core.error.stack` must change. A browser-side `<s3-uploader>` is
+> unaffected in shape: a remote one always received plain objects for
+> Core-side failures (now without `stack`), and one with an in-process Core
+> still exposes the original instance.
 
 ## Resumability
 
