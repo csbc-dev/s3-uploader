@@ -20,6 +20,71 @@ import { validateRemoteCoreUrl } from "./remoteConnection.js";
 type S3ElementError = WcsS3AnyError;
 
 /**
+ * Drop trailing `undefined` arguments before a command goes over the proxy.
+ *
+ * `@wc-bindable/remote` ≥ 0.10 validates `invoke` arguments as strict
+ * JsonValue and rejects the call before sending it
+ * (`WC_BINDABLE_INVALID_JSON_VALUE`) if any of them is `undefined` — 0.7
+ * sent such an argument as `null`. The Shell's optional trailing arguments
+ * are exactly that case: `requestUpload(key, size, contentType)` with no
+ * `content-type` attribute and a `File` whose `type` is empty (the default
+ * for an unrecognised extension, and for every example in this repo). An
+ * omitted trailing argument arrives at the Core as `undefined`, the same
+ * value an in-process `core.requestUpload(key, size)` call sees, so no Core
+ * signature needs to learn about `null`. A non-trailing `undefined` is
+ * still sent and rejected: no current call site produces one, and if one
+ * appears it surfaces through `_setRpcErrorState` instead of vanishing.
+ */
+function trimTrailingUndefined(args: readonly unknown[]): unknown[] {
+  let end = args.length;
+  while (end > 0 && args[end - 1] === undefined) end--;
+  return args.slice(0, end);
+}
+
+/**
+ * The code namespace the wc-bindable protocol reserves for itself, and the one
+ * code in it that can stand for a failure inside the Core.
+ */
+const PROTOCOL_CODE_PREFIX = "WC_BINDABLE_";
+const REMOTE_THROW_CODE = "WC_BINDABLE_REMOTE_THROW";
+
+/**
+ * `true` when a rejected RPC failed in the remote layer itself rather than
+ * inside a Core command — i.e. the Core never ran `_setError` for it, so no
+ * `error` update is coming through the `bind()` mirror.
+ *
+ * Decided from `err.code`, which `@wc-bindable/remote` ≥ 0.10 always sets on
+ * the errors it synthesizes and reserves the `WC_BINDABLE_` prefix for:
+ *   - consumer-only codes raised by `RemoteCoreProxy` before / instead of a
+ *     round-trip — `WC_BINDABLE_TIMEOUT`, `_ABORTED`, `_DISPOSED`,
+ *     `_TERMINAL_FAILURE`, `_PRE_SYNC_QUEUE_FULL`, `_INVALID_ACK_OPTIONS`,
+ *     `_SET_ACK_UNSUPPORTED` (its `CONSUMER_ONLY_CODES`), plus
+ *     `_INVALID_JSON_VALUE` for an argument rejected before sending;
+ *   - codes `RemoteShellProxy` answers with without the Core publishing
+ *     anything — `_INVALID_JSON_VALUE` / `_PROTOCOL_ERROR` /
+ *     `_UNDECLARED_COMMAND` (rejected before the Core is touched) and
+ *     `_INVALID_RETURN_VALUE` (the command succeeded; only its result could
+ *     not be sent).
+ * The exception is `WC_BINDABLE_REMOTE_THROW`: the producer substitutes it
+ * when the Core throws an error whose own code is in the reserved namespace,
+ * and the consumer substitutes it for a consumer-only code arriving in a
+ * `throw` envelope — so it can be a Core failure and stays with the mirror.
+ * An application code (`AccessDenied`, …) or no code at all is left to the
+ * mirror as well: a Core command that fails past its argument validation
+ * runs `_setError(e)` before rethrowing, and that update reaches the Shell
+ * ahead of the rejection on the ordered transport. (A validation throw —
+ * `raiseError` before any state change, e.g. a missing bucket — publishes
+ * nothing and so is not dispatched in remote mode either; that predates
+ * 0.10 and is outside this classification.)
+ */
+function isRemoteLayerFailure(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  return typeof code === "string"
+    && code.startsWith(PROTOCOL_CODE_PREFIX)
+    && code !== REMOTE_THROW_CODE;
+}
+
+/**
  * Browser shell. Selects a file (via the `file` JS property) and uploads it
  * **directly** to S3 using a presigned URL obtained from the Core. The
  * payload never crosses the WebSocket — only signing requests, progress
@@ -474,7 +539,11 @@ export class S3 extends HTMLElement {
         ? (this._remoteValues.error as S3ElementError)
         : this._errorState;
     }
-    return this._core?.error ?? this._errorState;
+    // In-process Core: read the original value (`_localError`), not the
+    // plain `{ name, message }` projection `core.error` publishes for the
+    // wire, so a local element keeps exposing the real `Error` instance
+    // (class, `stack`) exactly as it did before the projection existed.
+    return this._core?._localError ?? this._errorState;
   }
 
   // --- Trigger ---
@@ -560,6 +629,10 @@ export class S3 extends HTMLElement {
    * at each call site; the remote branch is typed as `Promise<unknown>` and
    * cast once at the return — matching the raw proxy API shape, which is
    * string-indexed RPC.
+   *
+   * Trailing `undefined` arguments are dropped before they reach the proxy
+   * (see `trimTrailingUndefined`); the local branch passes them through as
+   * ordinary omitted optionals.
    */
   private async _dispatchAsync<T>(
     remoteName: string,
@@ -567,7 +640,7 @@ export class S3 extends HTMLElement {
     local: (core: S3Core) => Promise<T>,
   ): Promise<T> {
     if (this._isRemote) {
-      return await this._proxy!.invokeWithOptions(remoteName, remoteArgs as unknown[], { timeoutMs: 0 }) as T;
+      return await this._proxy!.invokeWithOptions(remoteName, trimTrailingUndefined(remoteArgs), { timeoutMs: 0 }) as T;
     }
     if (!this._core) throw new Error("[@csbc-dev/s3-uploader] no core attached.");
     return await local(this._core);
@@ -605,7 +678,7 @@ export class S3 extends HTMLElement {
     local: (core: S3Core) => void,
   ): void {
     if (this._isRemote) {
-      this._proxy!.invoke(remoteName, ...remoteArgs).catch(() => {});
+      this._proxy!.invoke(remoteName, ...trimTrailingUndefined(remoteArgs)).catch(() => {});
       return;
     }
     if (this._core) local(this._core);
@@ -781,9 +854,19 @@ export class S3 extends HTMLElement {
    * bookkeeping) are NOT routed through this helper — the Core has no way
    * to know an XHR failed on the client, so the Shell is the only source of
    * the error event for those and MUST dispatch directly.
+   *
+   * The same holds for an RPC that failed in the remote layer instead of in
+   * the Core (`isRemoteLayerFailure`: a timeout, a disposed / failed proxy,
+   * an argument or return value rejected by the 0.10 JsonValue gate, …).
+   * The Core never published anything for those, so deferring to the
+   * mirror would leave `el.error` null and fire no event at all — and with
+   * `trigger = true`, whose `upload().catch(() => {})` swallows the
+   * rejection, the failure would be completely silent. Those are dispatched
+   * locally; a Core-side failure still is not, so there is still exactly
+   * one event per failure.
    */
   private _setRpcErrorState(error: unknown): void {
-    if (this._isRemote) return;
+    if (this._isRemote && !isRemoteLayerFailure(error)) return;
     this._setErrorState(error);
   }
 

@@ -133,7 +133,7 @@ This section is specific to `@csbc-dev/s3-uploader`. For end-user usage, securit
 
 - Package name: `@csbc-dev/s3-uploader` (see [package.json](package.json)).
 - Distribution: ESM only (`"type": "module"`).
-- Runtime dependencies: `@wc-bindable/core`, `@wc-bindable/remote`. **No AWS SDK** — SigV4 is hand-rolled on Web Crypto.
+- Runtime dependencies: `@wc-bindable/core`, `@wc-bindable/remote` (both `^0.10` — see the JsonValue convention below). **No AWS SDK** — SigV4 is hand-rolled on Web Crypto.
 - Dev dependencies of note: `typescript`, `vitest`, `@playwright/test`, `happy-dom`, `ws`.
 
 ### Source layout
@@ -147,7 +147,7 @@ src/
 ├── registerComponents.ts      ← customElements.define wiring
 ├── processEnv.ts              ← reads globalThis.S3_REMOTE_CORE_URL / process.env.S3_REMOTE_CORE_URL
 ├── retry.ts                   ← retryWithBackoff, PutHttpError, MissingEtagError, defaultPutRetryPolicy
-├── normaliseError.ts          ← shapes thrown values into Error instances on the wire
+├── normaliseError.ts          ← normalises thrown values; builds the wire-safe { name, message } error and the rethrown Error
 ├── raiseError.ts              ← consistent error-dispatch helper for the Shell
 ├── types.ts                   ← IS3Provider, PresignedUpload, S3RequestOptions, WcsS3Values, ...
 ├── core/
@@ -206,3 +206,6 @@ When fixing a bug, prefer adding a regression test to `__tests__/` first; reach 
 - **Provider wrapping over forking.** Pre-presign rejection (size cap, content-type allowlist, key-shape checks, per-tenant scoping) is done by wrapping `IS3Provider` and throwing from `presignUpload` / `initiateMultipart`, not by patching `AwsS3Provider`. See the recipe in [README.md](README.md#extension-points).
 - **Configure once, before connect.** `bootstrapS3()` / `setConfig()` is intended to run once before any element is connected to the document. Re-configuring after connect leaves already-connected elements on their cached settings while new ones see the new settings — undefined behavior.
 - **`ws.on("close", () => core.abort())` is load-bearing.** Without it, an interrupted multipart leaves orphan parts in S3 because the client cannot reach `abortMultipart` through a dead control channel. Any new server-example or doc snippet that omits it is wrong.
+- **Everything that crosses the wire must be a strict JsonValue** (`@wc-bindable/remote` ≥ 0.10). Declared property values (the event `detail` AND the getter — `sync` reads `core[name]` directly), command return values and command arguments are validated, and an `undefined`-valued member, `NaN`, a `Date` or any class instance rejects the *whole* value: a property `update` is dropped with only a server-side warning, a return becomes `WC_BINDABLE_INVALID_RETURN_VALUE`, an argument is refused before sending. Build optional members by omission (`withoutUndefined` / `buildMetadata` / `wireSafePresign` in `S3Core.ts`, `trimTrailingUndefined` in `S3.ts`), never `x || undefined`. Regressions here are silent in production, so cover them through the real proxies (`__tests__/s3RemoteJsonGate.test.ts`), not with `JSON.stringify`.
+- **`S3Core.error` is a plain `{ name, message }`, not an `Error` — on purpose.** Publishing the instance again (a `toJSON` patch does not help) or a member that can be `undefined` makes the producer drop every `error` update, and since the Shell leaves Core-side failures to that mirror, the browser then sees no `s3-uploader:error` at all. `stack` is withheld deliberately (SPEC-extensions § Error envelope: omit `stack` on untrusted boundaries by default) — do not add it back. The original instance lives in `_errorSource` and is read only by an in-process Shell via `_localError`. Provider / hook rejections are rethrown through `toError` so non-`Error` values keep `name` / `message` instead of becoming `NonErrorThrow`.
+- **`_setRpcErrorState` dispatches locally only for remote-layer failures.** A `WC_BINDABLE_*` code other than `WC_BINDABLE_REMOTE_THROW` means the Core never ran `_setError` (consumer-side timeout / dispose / JsonValue refusal, producer-side `INVALID_RETURN_VALUE`, …), so the Shell must dispatch or the failure is silent. Anything else is a Core failure already mirrored via `bind()` — dispatching it again breaks the one-failure-one-event contract.

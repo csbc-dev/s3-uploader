@@ -197,11 +197,17 @@ export interface S3Error {
 }
 
 /**
- * Shape produced by the `toJSON` monkey-patched onto errors surfaced through
- * the remote channel (see `S3Core._setError`). This is what arrives via the
- * `_remoteValues.error` field after JSON serialisation across the WebSocket,
- * so the element's `error` getter and any typed consumer must acknowledge
- * the possibility in the error union.
+ * Plain-object error shape — never a class instance.
+ *
+ * `S3Core.error` and its `s3-uploader:error` detail are always exactly
+ * `{ name, message }` in this shape (see `S3Core._setError`): that value
+ * crosses the WebSocket, `@wc-bindable/remote` ≥ 0.10 only transmits a
+ * strict JsonValue (an `Error` is rejected by prototype, `toJSON` or not),
+ * and `stack` is withheld from the untrusted browser. It is therefore also
+ * what a remote `<s3-uploader>.error` holds for any failure inside the
+ * Core. `stack` is only ever present on the in-process side, when the
+ * `normaliseError` helper projects a plain-object rejection that carried a
+ * string `stack`.
  */
 export interface SerializedError {
   name: string;
@@ -213,14 +219,19 @@ export interface SerializedError {
  * Canonical union for any error surfaced via `S3Core.error` / `<s3-uploader>.error`
  * / `WcsS3CoreValues.error`. A single alias keeps the union spelled out once:
  *   - `S3Error` covers protocol-level errors (provider/HTTP fault with code).
- *   - `Error` covers runtime exceptions (real Error instances from the local path).
- *   - `SerializedError` covers errors that crossed the WebSocket boundary
- *     (JSON-serialised `{ name, message, stack? }` — real Error instances no
- *     longer survive `JSON.parse`), as well as plain-object throws from
- *     providers that the `normaliseError` helper projects onto this shape.
+ *   - `Error` covers runtime exceptions: failures the Shell raises itself
+ *     (`PutHttpError`, `MissingEtagError`, a dropped WebSocket, an RPC the
+ *     remote layer rejected — these keep their class and `code`), and every
+ *     failure of an in-process (`attachLocalCore`) Core.
+ *   - `SerializedError` covers failures inside a Core — `S3Core.error`
+ *     itself, and what a remote Shell mirrors from it (`{ name, message }`;
+ *     class identity, `stack` and extra fields do not cross the wire) — as
+ *     well as plain-object throws that `normaliseError` projects onto this
+ *     shape.
  *   - `null` is the cleared / never-had-error state.
  * Consumers narrow with `instanceof Error` + shape checks; the alias itself
- * does not imply a discriminated union.
+ * does not imply a discriminated union. To discriminate a Core-side failure,
+ * match on `name` — it is the one identifying field that survives the wire.
  */
 export type WcsS3AnyError = S3Error | Error | SerializedError | null;
 

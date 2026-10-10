@@ -442,9 +442,12 @@ describe("S3 Shell remote mode — error-event de-duplication (C10-#2)", () => {
     //   2. The proxy's rejection propagated back to `_doSingle`, whose
     //      `catch` called `_setErrorState(e)` and dispatched its own
     //      `s3-uploader:error` event.
-    // The fix routes RPC catches through `_setRpcErrorState` (which is a
-    // no-op in remote mode) so only (1) remains. If the regression returns,
-    // `errorEvents.length` will be 2.
+    // The fix routes RPC catches through `_setRpcErrorState` (which leaves a
+    // Core-side failure to the mirror in remote mode) so only (1) remains.
+    // If the regression returns, `errorEvents.length` will be 2. Since
+    // @wc-bindable/remote 0.10 this also pins the opposite failure: a
+    // non-JsonValue `error` / an `undefined` RPC argument (the Blob below
+    // has no `type`) made the count 0 — see s3RemoteJsonGate.test.ts.
     const { client, server } = pairedTransports();
     const core = new S3Core(new FailingPresignProvider());
     core.bucket = "b";

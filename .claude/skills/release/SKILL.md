@@ -38,7 +38,7 @@ If any check fails, stop and report. Do not attempt fixes unless the user asks.
 
 ## Local-path dependency check (MANDATORY before publish)
 
-`package.json` `dependencies` currently pins both `@wc-bindable/core` and `@wc-bindable/remote` to semver ranges (`^0.4.0`). It is common during development to temporarily swap one of these for a sibling-monorepo `file:` reference (e.g. `file:../../wc-bindable-protocol/wc-bindable-protocol/packages/core`). **`npm publish` will refuse to publish a package whose `dependencies` contain a `file:` URI** — and even if a registry accepted it, downstream `npm install @csbc-dev/s3-uploader` on any machine without that exact directory layout would fail.
+`package.json` `dependencies` currently pins both `@wc-bindable/core` and `@wc-bindable/remote` to semver ranges (`^0.10.0`). It is common during development to temporarily swap one of these for a sibling-monorepo `file:` reference (e.g. `file:../../wc-bindable-protocol/wc-bindable-protocol/packages/core`). **`npm publish` will refuse to publish a package whose `dependencies` contain a `file:` URI** — and even if a registry accepted it, downstream `npm install @csbc-dev/s3-uploader` on any machine without that exact directory layout would fail.
 
 Before running any publish-prep step, confirm with the user:
 

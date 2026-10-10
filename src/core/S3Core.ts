@@ -4,8 +4,8 @@ import {
   S3ObjectMetadata, S3Progress, PostProcessHook, PostProcessContext, PostProcessOptions,
   MultipartInit, MultipartPartUrl, MultipartPart,
 } from "../types.js";
-import type { WcsS3AnyError } from "../types.js";
-import { normaliseError } from "../normaliseError.js";
+import type { WcsS3AnyError, SerializedError } from "../types.js";
+import { normaliseError, toError, toSerializedError } from "../normaliseError.js";
 
 /** S3 minimum part size (5 MiB) — last part is exempt. */
 const S3_MIN_PART_SIZE = 5 * 1024 * 1024;
@@ -23,6 +23,58 @@ const DEFAULT_PART_SIZE = 8 * 1024 * 1024;
 function computePartSize(totalSize: number, requested: number = DEFAULT_PART_SIZE): number {
   const requiredForCap = Math.ceil(totalSize / (S3_MAX_PARTS - 1));
   return Math.max(S3_MIN_PART_SIZE, requested, requiredForCap);
+}
+
+/**
+ * Shallow copy of `value` with every `undefined`-valued own key dropped.
+ *
+ * Whatever the Core publishes as a property value or returns from a command
+ * crosses the WebSocket, and `@wc-bindable/remote` ≥ 0.10 validates it as a
+ * strict JsonValue: an object member that is `undefined` is not omitted, it
+ * rejects the WHOLE value — a property `update` is dropped (the browser
+ * keeps its stale value) and a command return becomes a
+ * `WC_BINDABLE_INVALID_RETURN_VALUE` rejection. 0.7 serialised with
+ * `JSON.stringify`, which silently dropped such keys, so optional fields
+ * filled from optional inputs (`contentType: x || undefined`) and provider
+ * results with an unset optional member (`headers: undefined`, a wrapper
+ * that forgot `expiresAt`) used to work by accident. Dropping the key here
+ * reproduces exactly that old wire result — and keeps the in-process
+ * object identical to what a remote consumer receives.
+ */
+function withoutUndefined<T extends object>(value: T): T {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (v !== undefined) out[k] = v;
+  }
+  return out as T;
+}
+
+/**
+ * Build the `metadata` snapshot without `undefined`-valued members (see
+ * `withoutUndefined`): `size` is optional on `requestUpload`, and
+ * `contentType` is absent whenever neither the caller nor the `contentType`
+ * input supplied one — the default for an `<s3-uploader>` with no
+ * `content-type` attribute and a `File` whose `type` is empty.
+ */
+function buildMetadata(size: number | undefined, contentType: string | undefined): S3ObjectMetadata {
+  return withoutUndefined({ size, contentType });
+}
+
+/**
+ * Wire-safe copy of a provider presign result (see `withoutUndefined`).
+ * `headers` gets the same treatment one level down, because a wrapper that
+ * builds it conditionally (`{ "x-amz-…": opts.sse }`) is the common way an
+ * `undefined` sneaks in. Any other non-JSON member (a `Date` `expiresAt`,
+ * `NaN`, a class instance) is a violation of the `IS3Provider` contract and
+ * is left to fail loudly as `WC_BINDABLE_INVALID_RETURN_VALUE`.
+ */
+function wireSafePresign<T extends PresignedUpload | PresignedDownload>(presigned: T): T {
+  const copy = withoutUndefined(presigned);
+  const headers = (copy as Partial<PresignedUpload>).headers;
+  if (headers && typeof headers === "object") {
+    (copy as Partial<PresignedUpload>).headers = withoutUndefined(headers);
+  }
+  return copy;
 }
 
 /**
@@ -109,7 +161,20 @@ export class S3Core extends EventTarget {
   private _uploading: boolean = false;
   private _completed: boolean = false;
   private _metadata: S3ObjectMetadata | null = null;
-  private _error: WcsS3AnyError = null;
+  /**
+   * What the `error` property publishes: the plain `{ name, message }`
+   * projection of `_errorSource` (see `toSerializedError`). Kept separately
+   * because it is wire-visible twice — `RemoteShellProxy` forwards the
+   * `s3-uploader:error` detail as the `update` and reads `this.error`
+   * directly for `sync` — and both must be a strict JsonValue.
+   */
+  private _error: SerializedError | null = null;
+  /**
+   * The normalised original behind `_error` — the provider's / hook's real
+   * `Error` instance (class, `stack`, extra fields) when the failure was
+   * one. In-process only; see `_localError`.
+   */
+  private _errorSource: WcsS3AnyError = null;
 
   private _flushScheduled: boolean = false;
   private _rafId: number | ReturnType<typeof setTimeout> | 0 = 0;
@@ -214,7 +279,26 @@ export class S3Core extends EventTarget {
   get metadata(): S3ObjectMetadata | null {
     return this._metadata ? { ...this._metadata } : null;
   }
-  get error(): WcsS3AnyError { return this._error; }
+  /**
+   * The current failure as a plain `{ name, message }` object (or `null`).
+   * Never an `Error` instance: this getter is what `RemoteShellProxy` reads
+   * for `sync`, and `@wc-bindable/remote` ≥ 0.10 rejects class instances
+   * there regardless of `toJSON`. Returns a copy, like `metadata`, so a
+   * caller mutating it cannot reach the internal slot. Server code that
+   * needs the original exception should take it from the rejected command
+   * promise.
+   */
+  get error(): SerializedError | null { return this._error ? { ...this._error } : null; }
+
+  /**
+   * @internal — the normalised original behind `error` (the real `Error`
+   * instance, with class and `stack`, when the failure was one). Read only by
+   * an in-process Shell (`<s3-uploader>.attachLocalCore`) so its `error`
+   * keeps exposing the instance the way it did before `error` became a plain
+   * projection. Not a declared wcBindable property, so `RemoteShellProxy`
+   * never reads or forwards it.
+   */
+  get _localError(): WcsS3AnyError { return this._errorSource; }
 
   // --- Post-process hook registration (server-side only API) ---
 
@@ -291,10 +375,10 @@ export class S3Core extends EventTarget {
   }
 
   private _setError(err: unknown): void {
-    // Route every thrown value through the shared normaliser so `_error`
-    // never holds a bare string / nullish / arbitrary plain object — the
-    // declared type of the slot (`WcsS3AnyError`) is then an honest
-    // description of the runtime contents rather than a wishful cast.
+    // Route every thrown value through the shared normaliser so
+    // `_errorSource` never holds a bare string / nullish / arbitrary plain
+    // object — the declared type of the slot (`WcsS3AnyError`) is then an
+    // honest description of the runtime contents rather than a wishful cast.
     // Providers that reject with bare strings, AWS-SDK-shaped payloads, or
     // pre-serialised errors from another realm are projected onto the same
     // `SerializedError` shape the Shell's `_setErrorState` consumes, so
@@ -315,76 +399,20 @@ export class S3Core extends EventTarget {
     // into the same branch.
     if (normalised === null && this._error === null) return;
 
-    // Make the error JSON-safe for the remote transport (`JSON.stringify` of a
-    // bare Error collapses to `{}`). `_makeErrorJsonSafe` attaches a
-    // non-enumerable `toJSON` in place when it can, or returns a plain
-    // `SerializedError` clone when the error is frozen / sealed.
-    const { payload, fellBack, defineErr } = this._makeErrorJsonSafe(normalised);
-    if (fellBack) {
-      // Frozen / sealed errors cannot carry a `toJSON`, so the *dispatched
-      // detail* is a SerializedError-shaped clone while `this._error` keeps
-      // the original reference (local-mode `instanceof Error` checks still
-      // pass). Warn once so operators get a single signal; do not throw — the
-      // upload already failed and a second throw here would double-dispatch.
-      // Guard the warn for console-less sandboxed runtimes.
-      if (typeof console !== "undefined" && typeof console.warn === "function") {
-        console.warn(
-          "[@csbc-dev/s3-uploader] could not attach toJSON to error (frozen/sealed); " +
-          "dispatching SerializedError shape instead.",
-          defineErr,
-        );
-      }
-    }
-    this._error = normalised;
-    this._target.dispatchEvent(new CustomEvent("s3-uploader:error", { detail: payload, bubbles: true }));
-  }
-
-  /**
-   * Make a normalised error value JSON-safe for the remote transport. Real
-   * `Error` instances get a non-enumerable `toJSON` defined in place (so
-   * `JSON.stringify` emits `{ name, message, stack? }` instead of `{}`, while
-   * `for…in` / `Object.keys` shape is unchanged and local `instanceof Error`
-   * still holds). Plain `SerializedError` payloads are already JSON-safe and
-   * pass through untouched. Frozen / sealed errors cannot have properties
-   * defined on them — for those, `payload` is a plain SerializedError clone
-   * and `fellBack` is true so the caller can decide whether to warn.
-   *
-   * Shared by `_setError` and the warning-event serialiser so the monkey-patch
-   * logic lives in exactly one place.
-   */
-  private _makeErrorJsonSafe(
-    normalised: WcsS3AnyError,
-  ): { payload: WcsS3AnyError; fellBack: boolean; defineErr?: unknown } {
-    if (
-      !(normalised instanceof Error)
-      || Object.prototype.hasOwnProperty.call(normalised, "toJSON")
-      || typeof (normalised as { toJSON?: unknown }).toJSON === "function"
-    ) {
-      return { payload: normalised, fellBack: false };
-    }
-    try {
-      Object.defineProperty(normalised, "toJSON", {
-        value: () => ({
-          name: normalised.name,
-          message: normalised.message,
-          ...(normalised.stack ? { stack: normalised.stack } : {}),
-        }),
-        enumerable: false,
-        configurable: true,
-        writable: true,
-      });
-      return { payload: normalised, fellBack: false };
-    } catch (defineErr) {
-      return {
-        payload: {
-          name: normalised.name,
-          message: normalised.message,
-          ...(normalised.stack ? { stack: normalised.stack } : {}),
-        },
-        fellBack: true,
-        defineErr,
-      };
-    }
+    // Publish the plain `{ name, message }` projection, never the instance.
+    // The `error` getter and this event's detail are both wire-visible
+    // (`sync` reads the getter, `update` forwards the detail) and
+    // `@wc-bindable/remote` ≥ 0.10 accepts only a strict JsonValue there: an
+    // `Error` is rejected by prototype — the previous non-enumerable
+    // `toJSON` patch no longer helps, the validator ignores `toJSON` — and
+    // so is a `stack: undefined` member. A rejected value is dropped with a
+    // server-side warning only, while the Shell defers to this mirror for
+    // every Core-side failure, so the browser saw no `s3-uploader:error` at
+    // all. The original value stays in `_errorSource` for in-process
+    // readers (`_localError`).
+    this._errorSource = normalised;
+    this._error = toSerializedError(normalised);
+    this._target.dispatchEvent(new CustomEvent("s3-uploader:error", { detail: this.error, bubbles: true }));
   }
 
   // --- rAF batching for progress events ---
@@ -503,12 +531,10 @@ export class S3Core extends EventTarget {
       .catch((error: unknown) => {
         this._target.dispatchEvent(new CustomEvent("s3-uploader:abort-cleanup-warning", {
           detail: {
-            // Same wire-survivability projection as
-            // `s3-uploader:postprocess-warning`: a raw `Error` would JSON-stringify
-            // to `{}`, leaving remote ops with no signal beyond "cleanup failed
-            // for some unknown reason". `_serialiseWarningError` keeps local
-            // `instanceof Error` consumers happy and gives wire consumers the
-            // populated `{ name, message, stack? }` shape.
+            // Same projection as `s3-uploader:postprocess-warning`: listeners
+            // get an `Error` that still JSON-stringifies to a populated
+            // `{ name, message, stack? }` when they log or forward it —
+            // see `_serialiseWarningError`.
             error: this._serialiseWarningError(error),
             ctx: {
               bucket: options.bucket,
@@ -568,10 +594,12 @@ export class S3Core extends EventTarget {
     this._setCompleted(false);
     this._setEtag("");
     this._setKey(key);
-    this._setMetadata({ size, contentType: contentType || this._contentType || undefined });
+    this._setMetadata(buildMetadata(size, contentType || this._contentType || undefined));
     this._setProgress({ loaded: 0, total: size ?? 0, phase: "signing" });
     try {
-      const presigned = await this._provider.presignUpload(key, opts);
+      // Normalised before either return below: this value is the RPC result
+      // a remote Shell receives (see `wireSafePresign`).
+      const presigned = wireSafePresign(await this._provider.presignUpload(key, opts));
       // Superseded by a newer request while we awaited the presign. Bail
       // without touching `_singleUpload`, `_uploading`, or progress — the
       // newer request owns those slots now. Still return the presigned URL
@@ -604,15 +632,21 @@ export class S3Core extends EventTarget {
       this._setProgress({ loaded: 0, total: size ?? 0, phase: "uploading" });
       return presigned;
     } catch (e: unknown) {
+      // Rethrow a real `Error` (same instance when it already is one) so a
+      // provider that rejects with a plain object / string keeps its
+      // `name` / `message` across the remote hop instead of arriving as
+      // `NonErrorThrow` — see `toError`. Every provider-facing catch below
+      // does the same.
+      const err = toError(e);
       // Only mutate state if we are still the current generation — otherwise
       // we would clobber the newer request's in-flight state with our own
       // error / loading-false transitions.
       if (gen === this._generation) {
-        this._setError(e);
+        this._setError(err);
         this._setLoading(false);
         this._setUploading(false);
       }
-      throw e;
+      throw err;
     }
   }
 
@@ -639,10 +673,10 @@ export class S3Core extends EventTarget {
       } catch (e: unknown) {
         if (entry.fatal) throw e;
         // Project the thrown value through the same normaliser the error slot
-        // uses, so consumers that observe `s3-uploader:postprocess-warning` over
-        // the wire (where `JSON.stringify(Error)` collapses to `{}`) receive a
-        // populated `{ name, message, stack? }` shape instead of an empty
-        // object. Local subscribers see an `Error` instance unchanged.
+        // uses, so a subscriber that logs or forwards the detail with
+        // `JSON.stringify` (where a bare `Error` collapses to `{}`) gets a
+        // populated `{ name, message, stack? }` shape. Subscribers still see
+        // an `Error` instance.
         this._target.dispatchEvent(new CustomEvent("s3-uploader:postprocess-warning", {
           detail: { error: this._serialiseWarningError(e), ctx },
           bubbles: true,
@@ -653,20 +687,49 @@ export class S3Core extends EventTarget {
   }
 
   /**
-   * Project a thrown value into a JSON-safe shape for the warning event channels
-   * (`s3-uploader:postprocess-warning`, `s3-uploader:abort-cleanup-warning`). These
-   * detail payloads cross the WebSocket via the wc-bindable remote transport,
-   * where `JSON.stringify(Error)` collapses an `Error` instance to `{}` because
-   * the standard fields are non-enumerable. Shares `_makeErrorJsonSafe` with
-   * `_setError`: a non-enumerable `toJSON` is defined on the original error so
-   * local `instanceof Error` consumers still see the live reference, while
-   * remote consumers see `{ name, message, stack? }`. Falls back to a plain-
-   * object clone when the error is frozen / sealed — unlike `_setError`, the
-   * warning path does not console.warn on fallback (it is already a non-fatal
-   * channel).
+   * Project a thrown value for the warning event channels
+   * (`s3-uploader:postprocess-warning`, `s3-uploader:abort-cleanup-warning`).
+   *
+   * These events — like `s3-uploader:delete-during-upload-warning` — are NOT
+   * declared wcBindable properties, so `RemoteShellProxy` never forwards them:
+   * they reach only listeners on the Core's own target, i.e. server-side code
+   * (an operator that wants them in the browser has to relay them itself).
+   * Such listeners commonly log or relay the detail with `JSON.stringify`,
+   * which collapses an `Error` to `{}` because the standard fields are
+   * non-enumerable. A non-enumerable `toJSON` is therefore defined on the
+   * original error, so `instanceof Error` and the live reference survive
+   * while `JSON.stringify` emits `{ name, message, stack? }`. A frozen /
+   * sealed error cannot take the property; it is replaced by a plain clone
+   * of the same shape (silently — this is already a non-fatal channel).
+   *
+   * Unlike the `error` property this keeps `stack`: nothing here crosses the
+   * wire unless the operator's own code sends it.
    */
   private _serialiseWarningError(err: unknown): unknown {
-    return this._makeErrorJsonSafe(normaliseError(err)).payload;
+    const normalised = normaliseError(err);
+    if (
+      !(normalised instanceof Error)
+      || Object.prototype.hasOwnProperty.call(normalised, "toJSON")
+      || typeof (normalised as { toJSON?: unknown }).toJSON === "function"
+    ) {
+      return normalised;
+    }
+    const snapshot = (): SerializedError => ({
+      name: normalised.name,
+      message: normalised.message,
+      ...(normalised.stack ? { stack: normalised.stack } : {}),
+    });
+    try {
+      Object.defineProperty(normalised, "toJSON", {
+        value: snapshot,
+        enumerable: false,
+        configurable: true,
+        writable: true,
+      });
+      return normalised;
+    } catch {
+      return snapshot();
+    }
   }
 
   /**
@@ -785,12 +848,13 @@ export class S3Core extends EventTarget {
       this._setLoading(false);
       return download.url;
     } catch (e: unknown) {
+      const err = toError(e);
       if (gen === this._generation) {
-        this._setError(e);
+        this._setError(err);
         this._setUploading(false);
         this._setLoading(false);
       }
-      throw e;
+      throw err;
     } finally {
       // Clear the snapshot unconditionally — success and failure paths both
       // need to drop the slot so a subsequent `requestUpload` does not see a
@@ -826,15 +890,16 @@ export class S3Core extends EventTarget {
     const gen = this._generation;
     this._setError(null);
     try {
-      const result = await this._provider.presignDownload(key, this._baseRequestOptions());
+      const result = wireSafePresign(await this._provider.presignDownload(key, this._baseRequestOptions()));
       if (gen === this._generation) {
         this._setKey(key);
         this._setUrl(result.url);
       }
       return result;
     } catch (e: unknown) {
-      if (gen === this._generation) this._setError(e);
-      throw e;
+      const err = toError(e);
+      if (gen === this._generation) this._setError(err);
+      throw err;
     }
   }
 
@@ -909,8 +974,9 @@ export class S3Core extends EventTarget {
       // that started while this delete was in flight owns `_error` now;
       // overwriting it here would misattribute the delete failure to that
       // upload. The awaiting caller still sees the throw regardless.
-      if (gen === this._generation) this._setError(e);
-      throw e;
+      const err = toError(e);
+      if (gen === this._generation) this._setError(err);
+      throw err;
     } finally {
       if (driveLoading) this._setLoading(false);
     }
@@ -1013,7 +1079,7 @@ export class S3Core extends EventTarget {
     this._setCompleted(false);
     this._setEtag("");
     this._setKey(key);
-    this._setMetadata({ size, contentType: contentType || this._contentType || undefined });
+    this._setMetadata(buildMetadata(size, contentType || this._contentType || undefined));
     this._setProgress({ loaded: 0, total: size, phase: "signing" });
     const effectivePartSize = computePartSize(size, partSize);
     const partCount = Math.ceil(size / effectivePartSize);
@@ -1030,11 +1096,12 @@ export class S3Core extends EventTarget {
     try {
       ({ uploadId } = await this._provider.initiateMultipart(key, opts));
     } catch (e: unknown) {
+      const err = toError(e);
       if (gen === this._generation) {
-        this._setError(e);
+        this._setError(err);
         this._setLoading(false);
       }
-      throw e;
+      throw err;
     }
 
     // A newer requestUpload may have superseded us mid-init. Best-effort clean
@@ -1051,7 +1118,7 @@ export class S3Core extends EventTarget {
         const partNumber = i + 1;
         const start = i * effectivePartSize;
         const end = Math.min(start + effectivePartSize, size);
-        const presigned = await this._provider.presignPart(key, uploadId, partNumber, opts);
+        const presigned = wireSafePresign(await this._provider.presignPart(key, uploadId, partNumber, opts));
         // Per-part generation check: a large multipart can take many awaits
         // to sign, and a racing newer request (requestUpload,
         // requestMultipartUpload, abort) can easily fire mid-loop. Without
@@ -1064,7 +1131,7 @@ export class S3Core extends EventTarget {
         if (gen !== this._generation) {
           throw new Error("[@csbc-dev/s3-uploader] requestMultipartUpload superseded.");
         }
-        parts.push({
+        parts.push(withoutUndefined<MultipartPartUrl>({
           partNumber,
           url: presigned.url,
           range: [start, end],
@@ -1072,7 +1139,10 @@ export class S3Core extends EventTarget {
           // URLs for late parts before the PUT fires. For a large multipart
           // over a slow link, the last parts can reach their turn well after
           // the 900 s default window — without an expiresAt the Shell has no
-          // way to know whether to re-sign.
+          // way to know whether to re-sign. (A provider that omits it gets
+          // the key dropped rather than sent as `undefined`, which would fail
+          // the whole RPC on the wire; the Shell then re-signs before every
+          // PUT, exactly as it did when 0.7's JSON encoding dropped the key.)
           expiresAt: presigned.expiresAt,
           // Forward provider-supplied per-part headers (SSE-C, custom auth,
           // etc.). Symmetrical with single-PUT, which already threads
@@ -1082,17 +1152,18 @@ export class S3Core extends EventTarget {
           ...(presigned.headers && Object.keys(presigned.headers).length > 0
             ? { headers: presigned.headers }
             : {}),
-        });
+        }));
       }
     } catch (e: unknown) {
       // Roll back the just-initiated multipart so we do not leak. Surface
       // cleanup failures via the shared abort-cleanup-warning channel.
       this._fireAndForgetAbortMultipart(key, uploadId, opts, "presign-failure");
+      const err = toError(e);
       if (gen === this._generation) {
-        this._setError(e);
+        this._setError(err);
         this._setLoading(false);
       }
-      throw e;
+      throw err;
     }
 
     // Snapshot the options used for this multipart. completeMultipart, abort,
@@ -1131,7 +1202,14 @@ export class S3Core extends EventTarget {
     if (!mp) raiseError("signMultipartPart() called without an active multipart upload.");
     if (mp.uploadId !== uploadId) raiseError("signMultipartPart() uploadId mismatch.");
     if (mp.key !== key) raiseError(`signMultipartPart() key mismatch: expected ${mp.key}, got ${key}.`);
-    return await this._provider.presignPart(key, uploadId, partNumber, mp.options);
+    // No `_setError` here (a failed re-sign is reported by the Shell, which
+    // owns the part PUT and its retry), but the value / rejection still
+    // crosses the wire: same normalisation as `requestUpload`.
+    try {
+      return wireSafePresign(await this._provider.presignPart(key, uploadId, partNumber, mp.options));
+    } catch (e: unknown) {
+      throw toError(e);
+    }
   }
 
   /**
@@ -1236,12 +1314,13 @@ export class S3Core extends EventTarget {
       this._setLoading(false);
       return download.url;
     } catch (e: unknown) {
+      const err = toError(e);
       if (gen === this._generation) {
-        this._setError(e);
+        this._setError(err);
         this._setUploading(false);
         this._setLoading(false);
       }
-      throw e;
+      throw err;
     } finally {
       // Clear `_multipart` in a single place so both success + every failure
       // branch drop the slot deterministically. Previously the clear was
@@ -1298,6 +1377,10 @@ export class S3Core extends EventTarget {
       // untouched: it is a separate upload and this abort does not concern it.
       opts = this._baseRequestOptions();
     }
-    await this._provider.abortMultipart(key, uploadId, opts);
+    try {
+      await this._provider.abortMultipart(key, uploadId, opts);
+    } catch (e: unknown) {
+      throw toError(e);
+    }
   }
 }

@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { isJsonValue } from "@wc-bindable/remote";
 import { S3Core } from "../src/core/S3Core";
 import {
   IS3Provider, S3RequestOptions, PresignedUpload, PresignedDownload, MultipartPart,
@@ -145,7 +146,7 @@ describe("S3Core", () => {
     await expect(core.requestUpload("k", 1)).rejects.toThrow("boom");
     expect(core.uploading).toBe(false);
     expect(core.loading).toBe(false);
-    expect(core.error).toBeInstanceOf(Error);
+    expect(core.error).toEqual({ name: "Error", message: "boom" });
   });
 
   it("reportProgress coalesces via rAF and dispatches a snapshot", async () => {
@@ -227,7 +228,7 @@ describe("S3Core", () => {
     core.registerPostProcess(() => { seen.push("never"); });
     await expect(core.complete("k", "et")).rejects.toThrow("hook fail");
     expect(seen).toEqual([]);
-    expect(core.error).toBeInstanceOf(Error);
+    expect(core.error).toEqual({ name: "Error", message: "hook fail" });
     expect(core.uploading).toBe(false);
   });
 
@@ -459,7 +460,7 @@ describe("S3Core", () => {
   it("deleteObject surfaces provider errors", async () => {
     provider.deleteError = new Error("nope");
     await expect(core.deleteObject("k")).rejects.toThrow("nope");
-    expect(core.error).toBeInstanceOf(Error);
+    expect(core.error).toEqual({ name: "Error", message: "nope" });
     expect(core.loading).toBe(false);
   });
 
@@ -670,54 +671,198 @@ describe("S3Core", () => {
   });
 
   describe("error serialisation", () => {
-    it("JSON.stringify(core.error) emits { name, message, stack } for plain Error", async () => {
-      // Pin the toJSON monkey-patch behaviour so the remote transport, which
-      // JSON-serialises error detail across the WebSocket, always has a
-      // non-empty payload instead of `{}` (default Error serialisation).
+    // `error` is wire-visible twice: RemoteShellProxy forwards the
+    // `s3-uploader:error` detail as the `update` and reads `core.error` for
+    // `sync`. @wc-bindable/remote ≥ 0.10 drops any value that is not a strict
+    // JsonValue — an Error instance is rejected by prototype whatever its
+    // `toJSON` says, and so is an `undefined`-valued key. These tests
+    // validate with the same `isJsonValue` predicate the transport uses,
+    // not with `JSON.stringify` (which would accept both and prove nothing
+    // about the wire). The end-to-end delivery is pinned in
+    // s3ShellRemoteFailure.test.ts / s3RemoteJsonGate.test.ts.
+    it("publishes a thrown Error as a plain JsonValue { name, message } (no stack)", async () => {
       const err = new Error("payload-check");
       provider.presignError = err;
-      await expect(core.requestUpload("k", 1)).rejects.toThrow("payload-check");
-      expect(core.error).toBe(err);
-      const json = JSON.stringify(core.error);
-      const parsed = JSON.parse(json);
-      expect(parsed.name).toBe("Error");
-      expect(parsed.message).toBe("payload-check");
-      // stack is optional — provided in V8/Node, may be missing in exotic runtimes.
-      if (err.stack) expect(typeof parsed.stack).toBe("string");
+      const details: unknown[] = [];
+      core.addEventListener("s3-uploader:error", (e) => details.push((e as CustomEvent).detail));
+      await expect(core.requestUpload("k", 1)).rejects.toBe(err);
+
+      expect(core.error).toEqual({ name: "Error", message: "payload-check" });
+      expect(isJsonValue(core.error)).toBe(true);
+      // `stack` is not published to the (untrusted) browser — see
+      // `toSerializedError`.
+      expect(core.error).not.toHaveProperty("stack");
+      expect(details).toEqual([{ name: "Error", message: "payload-check" }]);
+      expect(isJsonValue(details[0])).toBe(true);
+      // The original instance is still reachable in-process (the local
+      // Shell reads it through `_localError`).
+      expect(core._localError).toBe(err);
     });
 
-    it("projects a plain-object throw { name, message, stack } onto a fully-populated SerializedError", async () => {
+    it("the getter returns a copy, so a caller cannot mutate the published slot", async () => {
+      provider.presignError = new Error("orig");
+      await expect(core.requestUpload("k", 1)).rejects.toThrow("orig");
+      const first = core.error as { message: string };
+      first.message = "tampered";
+      expect(core.error).toEqual({ name: "Error", message: "orig" });
+    });
+
+    it("rethrows a plain-object rejection as an Error that keeps name / message", async () => {
       // Some providers (AWS SDK variants, cross-realm throws, pre-serialised
-      // errors coming back over the WebSocket) reject with plain objects
-      // rather than `Error` instances. `normaliseError` is the only choke
-      // point that promises those consumers see the typed union, so pin
-      // here that the stored `core.error` comes out as the SerializedError
-      // shape with every field populated from the thrown payload.
+      // errors) reject with plain objects. @wc-bindable/remote 0.10 would
+      // canonicalise a raw non-Error throw to `NonErrorThrow` /
+      // "[object Object]", so the Core rethrows a real Error built from the
+      // normalised shape instead (`toError`).
       const plain = { name: "AccessDenied", message: "denied", stack: "at X" };
       provider.presignError = plain;
-      await expect(core.requestUpload("k", 1)).rejects.toBe(plain);
-      const stored = core.error;
-      // Not the original reference — a freshly-constructed SerializedError.
-      expect(stored).not.toBe(plain);
-      expect(stored).not.toBeInstanceOf(Error);
-      expect(stored).toEqual({
-        name: "AccessDenied",
-        message: "denied",
-        stack: "at X",
+      const rejection = await core.requestUpload("k", 1).then(
+        () => { throw new Error("expected a rejection"); },
+        (e: unknown) => e,
+      );
+      expect(rejection).toBeInstanceOf(Error);
+      expect((rejection as Error).name).toBe("AccessDenied");
+      expect((rejection as Error).message).toBe("denied");
+      expect(core.error).toEqual({ name: "AccessDenied", message: "denied" });
+      expect(isJsonValue(core.error)).toBe(true);
+      expect(core._localError).toBe(rejection);
+    });
+
+    it("rethrows a bare-string rejection as an Error with message === the string", async () => {
+      provider.presignError = "boom";
+      const rejection = await core.requestUpload("k", 1).then(
+        () => { throw new Error("expected a rejection"); },
+        (e: unknown) => e,
+      );
+      expect(rejection).toBeInstanceOf(Error);
+      expect((rejection as Error).message).toBe("boom");
+      expect(core.error).toEqual({ name: "Error", message: "boom" });
+    });
+
+    it("a nullish rejection still publishes an error instead of silently clearing it", async () => {
+      provider.presignUpload = async () => { throw undefined; };
+      await expect(core.requestUpload("k", 1)).rejects.toThrow("undefined");
+      expect(core.error).toEqual({ name: "Error", message: "undefined" });
+      expect(core.loading).toBe(false);
+    });
+
+    it("a plain-object rejection without `stack` gets no `stack: undefined` key anywhere", async () => {
+      // The old normaliser produced `{ name, message, stack: undefined }`,
+      // which is not a JsonValue — the dispatch was dropped on the wire.
+      provider.presignError = { message: "no stack here" };
+      const details: unknown[] = [];
+      core.addEventListener("s3-uploader:error", (e) => details.push((e as CustomEvent).detail));
+      await expect(core.requestUpload("k", 1)).rejects.toThrow("no stack here");
+      expect(isJsonValue(details[0])).toBe(true);
+      expect(isJsonValue(core.error)).toBe(true);
+    });
+
+    it("signMultipartPart / abortMultipart rethrow non-Error rejections as Errors too", async () => {
+      await core.requestMultipartUpload("mp", 20 * 1024 * 1024);
+      provider.presignPartError = { name: "SlowDown", message: "throttled" } as unknown as Error;
+      await expect(core.signMultipartPart("mp", "upload-1", 2)).rejects.toMatchObject({
+        name: "SlowDown", message: "throttled",
+      });
+      await expect(core.signMultipartPart("mp", "upload-1", 2)).rejects.toBeInstanceOf(Error);
+      provider.abortMultipart = async () => { throw "abort refused"; };
+      await expect(core.abortMultipart("mp", "upload-1")).rejects.toThrow("abort refused");
+    });
+
+    it("warning events keep an Error instance that JSON-stringifies to { name, message, stack? }", async () => {
+      await core.requestUpload("k", 1);
+      const warnings: Array<{ error: unknown }> = [];
+      core.addEventListener("s3-uploader:postprocess-warning", (e) => {
+        warnings.push((e as CustomEvent).detail);
+      });
+      const hookErr = new Error("audit down");
+      core.registerPostProcess(() => { throw hookErr; }, { fatal: false });
+      await core.complete("k", "et");
+      expect(warnings[0].error).toBe(hookErr);
+      expect(JSON.parse(JSON.stringify(warnings[0].error))).toMatchObject({
+        name: "Error", message: "audit down",
       });
     });
 
-    it("wraps a bare-string throw in an Error instance with message === the string", async () => {
-      // Final fallback branch of `normaliseError`: a rejection that is not
-      // nullish, not an Error, and not a plain object with a `message`
-      // field. Bare strings and numbers end up here. Ensure they become
-      // real Error instances so consumers can rely on `instanceof Error`
-      // narrowing across every code path.
-      provider.presignError = "boom";
-      await expect(core.requestUpload("k", 1)).rejects.toBe("boom");
-      const stored = core.error;
-      expect(stored).toBeInstanceOf(Error);
-      expect((stored as Error).message).toBe("boom");
+    it("a frozen error on a warning channel falls back to a plain clone", async () => {
+      await core.requestUpload("k", 1);
+      const warnings: Array<{ error: unknown }> = [];
+      core.addEventListener("s3-uploader:postprocess-warning", (e) => {
+        warnings.push((e as CustomEvent).detail);
+      });
+      const frozen = Object.freeze(new Error("frozen"));
+      core.registerPostProcess(() => { throw frozen; }, { fatal: false });
+      await core.complete("k", "et");
+      expect(warnings[0].error).not.toBe(frozen);
+      expect(warnings[0].error).toMatchObject({ name: "Error", message: "frozen" });
+    });
+  });
+
+  describe("wire-safe property and return values (@wc-bindable/remote >= 0.10)", () => {
+    it("metadata omits contentType instead of carrying undefined", async () => {
+      // No contentType argument and no contentType input: the default for an
+      // <s3-uploader> without a `content-type` attribute uploading a File
+      // whose `type` is "". `{ contentType: undefined }` is not a JsonValue,
+      // so the whole metadata update used to be dropped on the wire.
+      const details: unknown[] = [];
+      core.addEventListener("s3-uploader:metadata-changed", (e) => details.push((e as CustomEvent).detail));
+      await core.requestUpload("k", 12);
+      expect(core.metadata).toEqual({ size: 12 });
+      expect(core.metadata).not.toHaveProperty("contentType");
+      expect(isJsonValue(core.metadata)).toBe(true);
+      expect(details).toEqual([{ size: 12 }]);
+    });
+
+    it("metadata omits size when requestUpload is called without one", async () => {
+      await core.requestUpload("k", undefined, "text/plain");
+      expect(core.metadata).toEqual({ contentType: "text/plain" });
+      expect(isJsonValue(core.metadata)).toBe(true);
+    });
+
+    it("multipart metadata omits contentType instead of carrying undefined", async () => {
+      await core.requestMultipartUpload("mp", 20 * 1024 * 1024);
+      expect(core.metadata).toEqual({ size: 20 * 1024 * 1024 });
+      expect(isJsonValue(core.metadata)).toBe(true);
+    });
+
+    it("drops undefined members from a custom provider's presign results", async () => {
+      // A wrapper provider that leaves optional members unset. 0.7's
+      // JSON.stringify dropped these keys; 0.10 rejects the whole return
+      // value (`WC_BINDABLE_INVALID_RETURN_VALUE`) unless the Core does.
+      provider.presignUpload = async (key: string) => ({
+        url: `https://example.com/upload/${key}`,
+        method: "PUT" as const,
+        headers: undefined,
+        expiresAt: Date.now() + 60_000,
+      });
+      const presigned = await core.requestUpload("k", 1);
+      expect(presigned).not.toHaveProperty("headers");
+      expect(isJsonValue(presigned)).toBe(true);
+
+      provider.presignDownload = async (key: string) => ({
+        url: `https://example.com/download/${key}`,
+        method: "GET" as const,
+        expiresAt: undefined as unknown as number,
+      });
+      const download = await core.requestDownload("k");
+      expect(download).toEqual({ url: "https://example.com/download/k", method: "GET" });
+      expect(isJsonValue(download)).toBe(true);
+    });
+
+    it("drops a missing part expiresAt and undefined header values from multipart results", async () => {
+      provider.presignPart = async (_key: string, _uploadId: string, partNumber: number) => ({
+        url: `https://example.com/part/${partNumber}`,
+        method: "PUT" as const,
+        headers: { "x-amz-meta-a": "1", "x-amz-meta-b": undefined as unknown as string },
+        expiresAt: undefined as unknown as number,
+      });
+      const init = await core.requestMultipartUpload("mp", 20 * 1024 * 1024);
+      expect(isJsonValue(init)).toBe(true);
+      for (const part of init.parts) {
+        expect(part).not.toHaveProperty("expiresAt");
+        expect(part.headers).toEqual({ "x-amz-meta-a": "1" });
+      }
+      const refreshed = await core.signMultipartPart("mp", "upload-1", 1);
+      expect(isJsonValue(refreshed)).toBe(true);
+      expect(refreshed.headers).toEqual({ "x-amz-meta-a": "1" });
     });
   });
 
