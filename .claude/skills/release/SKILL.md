@@ -70,6 +70,8 @@ For this package, the following count as **breaking**:
 - Any change to the `S3OwnedError` discriminated union (`PutHttpError`, `MissingEtagError`) — adding a member is breaking by design.
 - Any change to the WebSocket wire protocol used between `RemoteShellProxy` and `RemoteCoreProxy`.
 
+> **While the package is in `0.x.y`, map a breaking change to minor and a feature addition or fix to patch.** This is the convention of the upstream `@wc-bindable/*` line and of `@csbc-dev/ai-agent`. Upstream still ships breaking changes as 0.x minors, so a 1.0 here would not be a stable promise. Bump major only once the package is at 1.0 or later.
+
 Once the user approves the bump level, update `version` in [package.json](package.json). Prefer editing the field directly rather than running `npm version`, so the user keeps control over commit/tag creation.
 
 ---
