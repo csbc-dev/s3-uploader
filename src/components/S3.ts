@@ -68,20 +68,39 @@ const REMOTE_THROW_CODE = "WC_BINDABLE_REMOTE_THROW";
  * The exception is `WC_BINDABLE_REMOTE_THROW`: the producer substitutes it
  * when the Core throws an error whose own code is in the reserved namespace,
  * and the consumer substitutes it for a consumer-only code arriving in a
- * `throw` envelope — so it can be a Core failure and stays with the mirror.
- * An application code (`AccessDenied`, …) or no code at all is left to the
- * mirror as well: a Core command that fails past its argument validation
- * runs `_setError(e)` before rethrowing, and that update reaches the Shell
- * ahead of the rejection on the ordered transport. (A validation throw —
- * `raiseError` before any state change, e.g. a missing bucket — publishes
- * nothing and so is not dispatched in remote mode either; that predates
- * 0.10 and is outside this classification.)
+ * `throw` envelope — so it can be a Core failure.
+ *
+ * A `false` here does NOT mean the mirror delivered the failure: an
+ * application code (`AccessDenied`, …) or no code at all is a Core failure
+ * that may or may not have been published — a provider / hook rejection
+ * runs `_setError(e)` before rethrowing, but an argument / state validation
+ * throw (`raiseError` before any state change: no bucket, key mismatch, no
+ * active upload) and a superseded generation publish nothing.
+ * `_setRpcErrorState` settles that case by observation (`_remoteErrorSeq`).
  */
 function isRemoteLayerFailure(error: unknown): boolean {
   const code = (error as { code?: unknown } | null | undefined)?.code;
   return typeof code === "string"
     && code.startsWith(PROTOCOL_CODE_PREFIX)
     && code !== REMOTE_THROW_CODE;
+}
+
+/**
+ * Where the Shell's two "this failure has already been reported" counters
+ * stood when an operation began — see `_setRpcErrorState`.
+ */
+interface ErrorWindow {
+  /**
+   * `S3._connectionFailureSeq` at the start of the upload run (or of a
+   * standalone `setWithAck`): the WebSocket failure handler has reported a
+   * drop since then iff the counter moved.
+   */
+  readonly connectionFailures: number;
+  /**
+   * `S3._remoteErrorSeq` when the RPC was sent: the Core's `bind()` mirror
+   * has delivered a failure since then iff the counter moved.
+   */
+  readonly coreErrors: number;
 }
 
 /**
@@ -156,6 +175,29 @@ export class S3 extends HTMLElement {
   private _multipartLoaded: Map<number, number> = new Map();
   private _errorState: S3ElementError = null;
   private _hasLocalError: boolean = false;
+  /**
+   * Monotonic count of non-null `error` values the remote Core delivered
+   * through `bind()` — i.e. of `s3-uploader:error` events the mirror
+   * dispatched. An RPC snapshots it when sent (`ErrorWindow.coreErrors`), so
+   * on rejection `_setRpcErrorState` can tell "the Core already published
+   * this failure" (the counter moved: `RemoteShellProxy` forwards the
+   * `update` synchronously from `_setError`, ahead of the command's `throw`
+   * on the FIFO channel) from "the Core rejected without publishing" (it did
+   * not). Never reset — a reset could make a pre-reset publish look unseen.
+   *
+   * Stripe's Shell keeps a counter of the same name; unlike that one this
+   * counts only non-null values, because a `_setError(null)` reset at the
+   * start of a command is not a reported failure.
+   */
+  private _remoteErrorSeq: number = 0;
+  /**
+   * Monotonic count of WebSocket failures the `onFail` handler reported.
+   * Everything an in-flight upload run or `setWithAck` fails with after
+   * that — the RPCs `_disposeRemote` rejects with `WC_BINDABLE_DISPOSED`,
+   * the cancelled XHRs' "upload aborted." — is a consequence of the drop
+   * that has already been reported, so it must not add a second event.
+   */
+  private _connectionFailureSeq: number = 0;
   /** Set true when abort() runs so part workers can short-circuit. */
   private _aborted: boolean = false;
   /** The currently-running upload(), if any. Used to serialize re-entry. */
@@ -223,6 +265,14 @@ export class S3 extends HTMLElement {
       // just stops the client from making it worse.
       this._aborted = true;
       this._cancelXhrs();
+      // This drop is the one failure reported for whatever is in flight:
+      // the cancelled XHRs reject with "upload aborted.", and
+      // `_disposeRemote()` below rejects every pending RPC / `setWithAck`
+      // with `WC_BINDABLE_DISPOSED`. Their handlers compare this counter
+      // with their `ErrorWindow` and stay silent, so the event subscribers
+      // get is the one below — it names the cause and the URL, which the
+      // consequential rejections do not.
+      this._connectionFailureSeq++;
       this._setErrorState(new Error(
         `[@csbc-dev/s3-uploader] WebSocket connection ${opened ? "lost" : "failed"}: ${url}`
       ));
@@ -326,6 +376,20 @@ export class S3 extends HTMLElement {
     this.dispatchEvent(new CustomEvent("s3-uploader:error", { detail: null, bubbles: true }));
   }
 
+  /**
+   * Snapshot the "already reported" counters for an operation starting now.
+   * Pass the upload run's own window as `run` for an RPC inside that run, so
+   * a WebSocket drop is matched against the whole run (every later failure
+   * of the run is its consequence) while a Core publish is matched against
+   * this RPC alone.
+   */
+  private _errorWindow(run?: ErrorWindow): ErrorWindow {
+    return {
+      connectionFailures: run ? run.connectionFailures : this._connectionFailureSeq,
+      coreErrors: this._remoteErrorSeq,
+    };
+  }
+
   /** @internal — visible for testing */
   _connectRemote(transport: ClientTransport): void {
     // Defend against dual-attached state. If a caller (test, integration
@@ -341,6 +405,18 @@ export class S3 extends HTMLElement {
     this._proxy = createRemoteCoreProxy(S3Core.wcBindable, transport);
     this._unbind = bind(this._proxy, (name, value) => {
       this._remoteValues[name] = value;
+      if (name === "error" && value != null) {
+        // The Core reported a failure. Count it (see `_remoteErrorSeq`), and
+        // let it supersede an older local error so `el.error` agrees with
+        // the event dispatched below — otherwise the getter's
+        // `_hasLocalError` branch would keep returning, say, the previous
+        // run's PUT failure. A `null` publish (the Core clearing its slot as
+        // a command starts) leaves the local layer alone. Same rule as the
+        // Stripe Shell's mirror.
+        this._remoteErrorSeq++;
+        this._hasLocalError = false;
+        this._errorState = null;
+      }
       const prop = S3.wcBindable.properties.find(p => p.name === name);
       /* v8 ignore start -- bind callback names always come from declared wcBindable properties */
       if (prop) {
@@ -358,14 +434,20 @@ export class S3 extends HTMLElement {
     // through after the client connects. `attributeChangedCallback` fires
     // before `_proxy` exists (during upgrade), so the empty-string sync
     // must happen here or not at all.
+    //
+    // These acks are queued until the first `sync`, so a socket that never
+    // opens rejects all of them with `WC_BINDABLE_DISPOSED` right after
+    // `onFail` reported the failed connection — `_setRpcErrorState` (not
+    // `_setErrorState`) keeps that to the one event.
+    const since = this._errorWindow();
     if (this.hasAttribute("bucket")) {
-      this._proxy!.setWithAck("bucket", this.bucket).catch((e: unknown) => this._setErrorState(e));
+      this._proxy!.setWithAck("bucket", this.bucket).catch((e: unknown) => this._setRpcErrorState(e, since));
     }
     if (this.hasAttribute("prefix")) {
-      this._proxy!.setWithAck("prefix", this.prefix).catch((e: unknown) => this._setErrorState(e));
+      this._proxy!.setWithAck("prefix", this.prefix).catch((e: unknown) => this._setRpcErrorState(e, since));
     }
     if (this.hasAttribute("content-type")) {
-      this._proxy!.setWithAck("contentType", this.contentType).catch((e: unknown) => this._setErrorState(e));
+      this._proxy!.setWithAck("contentType", this.contentType).catch((e: unknown) => this._setRpcErrorState(e, since));
     }
   }
 
@@ -809,9 +891,12 @@ export class S3 extends HTMLElement {
     // assumption that every reject path would race the overwrite correctly —
     // the generation counter makes the ownership test deterministic.
     const myGen = ++this._uploadGeneration;
+    // The run's error window: a failure of this run is reported at most once
+    // (see `_setRpcErrorState` / `_setTransferErrorState`).
+    const run = this._errorWindow();
     const promise = (file.size > this.multipartThreshold)
-      ? this._doMultipart(key, file, contentType)
-      : this._doSingle(key, file, contentType);
+      ? this._doMultipart(key, file, contentType, run)
+      : this._doSingle(key, file, contentType, run);
     this._currentUpload = promise;
     // Use .then(cleanup, cleanup) — NOT .finally() — for the bookkeeping
     // chain. promise.finally(cb) returns a *new* promise that mirrors the
@@ -837,45 +922,69 @@ export class S3 extends HTMLElement {
   }
 
   /**
-   * Route a failure into the local error slot only when the Core has not
-   * already published it through the `bind()` mirror. In remote mode, every
-   * `_dispatchAsync` RPC (`_requestUpload`, `_complete`, `_requestMultipart`,
-   * `_completeMultipart`, `_signMultipartPart`) that throws on the server
-   * side has already triggered `S3Core._setError(...)` BEFORE the proxy's
-   * rejection reaches us — the Core runs `_setError(e); throw e;` as a
-   * single beat, and the bind subscription delivers the `error` property
-   * update to `_remoteValues.error` + dispatches `s3-uploader:error` along with
-   * (not after) the rpc-reject delivery. Calling `_setErrorState(e)` in the
-   * RPC catch on top of that produced two `s3-uploader:error` events for the
-   * same logical failure, which broke the "one failure, one event"
-   * contract subscribers rely on for reactive UI state transitions.
+   * Report a rejected RPC (a Core command or a `setWithAck`) exactly once:
+   * dispatch it locally unless something already delivered an
+   * `s3-uploader:error` for this failure. `since` is the `ErrorWindow` taken
+   * when the operation started. In order:
+   *
+   * 1. The WebSocket failure handler (`onFail`) reported a drop since the
+   *    run / `setWithAck` began → stay silent. The rejection (typically
+   *    `WC_BINDABLE_DISPOSED` from `_disposeRemote`) is that drop's
+   *    consequence, and the drop's own event is the more informative one.
+   * 2. A remote-layer failure (`isRemoteLayerFailure`: a timeout, a disposed
+   *    / failed proxy, an argument or return value refused by the 0.10
+   *    JsonValue gate, …) → dispatch. The Core never published anything for
+   *    it, so deferring to the mirror would leave `el.error` null and fire
+   *    no event — and with `trigger = true`, whose `upload().catch(() => {})`
+   *    swallows the rejection, the failure would be completely silent.
+   * 3. Otherwise it is a Core failure, which the Core may or may not have
+   *    published. A provider / hook rejection runs `_setError(e)` before
+   *    rethrowing, and `RemoteShellProxy` forwards that `update` the moment
+   *    it is dispatched — ahead of the command's `throw` on the FIFO
+   *    channel — so the mirror has dispatched it before this catch runs:
+   *    `_remoteErrorSeq` moved since the RPC was sent → stay silent
+   *    (dispatching again broke the one-failure-one-event contract).
+   * 4. The counter did not move: the Core rejected without publishing — an
+   *    argument / state validation throw (`raiseError`: no bucket, key
+   *    mismatch, no active upload) or a superseded generation → dispatch.
+   *    Deferring to the mirror here is what used to make these failures as
+   *    silent as step 2 describes.
+   *
+   * With an in-process Core neither counter moves during an operation (there
+   * is no `bind()` mirror and no WebSocket), so every failure is dispatched
+   * here, as it always was.
    *
    * Local-failure paths (`_putBlob`, `_putPart`, the aborted-multipart
-   * bookkeeping) are NOT routed through this helper — the Core has no way
-   * to know an XHR failed on the client, so the Shell is the only source of
-   * the error event for those and MUST dispatch directly.
-   *
-   * The same holds for an RPC that failed in the remote layer instead of in
-   * the Core (`isRemoteLayerFailure`: a timeout, a disposed / failed proxy,
-   * an argument or return value rejected by the 0.10 JsonValue gate, …).
-   * The Core never published anything for those, so deferring to the
-   * mirror would leave `el.error` null and fire no event at all — and with
-   * `trigger = true`, whose `upload().catch(() => {})` swallows the
-   * rejection, the failure would be completely silent. Those are dispatched
-   * locally; a Core-side failure still is not, so there is still exactly
-   * one event per failure.
+   * bookkeeping) go through `_setTransferErrorState` instead — the Core has
+   * no way to know an XHR failed on the client, so only step 1 applies.
    */
-  private _setRpcErrorState(error: unknown): void {
-    if (this._isRemote && !isRemoteLayerFailure(error)) return;
+  private _setRpcErrorState(error: unknown, since: ErrorWindow): void {
+    if (this._connectionFailureSeq !== since.connectionFailures) return;
+    if (!isRemoteLayerFailure(error) && this._remoteErrorSeq !== since.coreErrors) return;
     this._setErrorState(error);
   }
 
-  private async _doSingle(key: string, file: Blob, contentType: string | undefined): Promise<string | null> {
+  /**
+   * Report a failure of the Shell's own data-plane work (a PUT, a part PUT,
+   * a part re-sign, an aborted multipart) for the upload run whose window is
+   * `run`. The Core never publishes these — it cannot see an XHR, and
+   * `signMultipartPart` deliberately does not `_setError` — so the Shell is
+   * the only source of the event, except when the WebSocket failure handler
+   * already reported the drop that aborted the run (step 1 of
+   * `_setRpcErrorState`).
+   */
+  private _setTransferErrorState(error: unknown, run: ErrorWindow): void {
+    if (this._connectionFailureSeq !== run.connectionFailures) return;
+    this._setErrorState(error);
+  }
+
+  private async _doSingle(key: string, file: Blob, contentType: string | undefined, run: ErrorWindow): Promise<string | null> {
     let presigned: PresignedUpload;
+    const requestWindow = this._errorWindow(run);
     try {
       presigned = await this._requestUpload(key, file.size, contentType);
     } catch (e: unknown) {
-      this._setRpcErrorState(e);
+      this._setRpcErrorState(e, requestWindow);
       throw e;
     }
     let etag = "";
@@ -883,30 +992,31 @@ export class S3 extends HTMLElement {
       etag = await this._putBlob(presigned, file);
     } catch (e: unknown) {
       // Local XHR failure — the remote Core has no idea the PUT failed, so
-      // the Shell is the only source of the error event here. Always set
-      // local error state; no double-dispatch risk because the Core does
-      // not publish one of its own for this path.
-      this._setErrorState(e);
+      // the Shell is the only source of the error event here (unless a
+      // WebSocket drop cancelled the PUT and has already been reported).
+      this._setTransferErrorState(e, run);
       // Notify the Core so it can drop uploading state. Best-effort.
       this._abortFireAndForget();
       throw e;
     }
+    const completeWindow = this._errorWindow(run);
     try {
       const downloadUrl = await this._complete(key, etag);
       this._clearErrorState();
       return downloadUrl;
     } catch (e: unknown) {
-      this._setRpcErrorState(e);
+      this._setRpcErrorState(e, completeWindow);
       throw e;
     }
   }
 
-  private async _doMultipart(key: string, file: Blob, contentType: string | undefined): Promise<string | null> {
+  private async _doMultipart(key: string, file: Blob, contentType: string | undefined, run: ErrorWindow): Promise<string | null> {
     let init: MultipartInit;
+    const requestWindow = this._errorWindow(run);
     try {
       init = await this._requestMultipart(key, file.size, contentType);
     } catch (e: unknown) {
-      this._setRpcErrorState(e);
+      this._setRpcErrorState(e, requestWindow);
       throw e;
     }
     const totalSize = file.size;
@@ -944,42 +1054,31 @@ export class S3 extends HTMLElement {
       this._cancelXhrs();
       this._abortMultipartFireAndForget(key, init.uploadId);
       const err = firstError ?? new Error("[@csbc-dev/s3-uploader] upload aborted.");
-      // Preserve a more specific error already surfaced by the transport-failure
-      // handler — overwriting it with a generic "upload aborted" hides the real
-      // cause from the consumer. We still throw so the upload promise rejects.
+      // Every failure that lands here is the Shell's own: a part PUT, or a
+      // part re-sign (`signMultipartPart` never publishes on the Core's
+      // `error`), or an abort. When a WebSocket drop is what aborted the run,
+      // `onFail` has already reported it — and that event names the real
+      // cause, which a generic "upload aborted" would hide — so
+      // `_setTransferErrorState` stays silent then. We still throw so the
+      // upload promise rejects.
       //
-      // In remote mode, if the failure originated from an RPC (typically
-      // `_signMultipartPart` during a mid-stream re-sign or
-      // `requestMultipartUpload` / `completeMultipart` failures that route
-      // through `_setRpcErrorState`), the server Core has already published
-      // the error via `bind()` → `_remoteValues.error` — dispatching locally
-      // on top of that produces a duplicate `s3-uploader:error` event for one
-      // logical failure. Skip the local dispatch when the remote slot has a
-      // non-null error; the `error` getter returns the remote value so
-      // subscribers still see the failure through the already-delivered
-      // event.
-      //
-      // The check is `!= null`, NOT `"error" in _remoteValues`: Core's
-      // `requestMultipartUpload` calls `_setError(null)` at the start of
-      // every run to clear prior errors, which propagates through `bind()`
-      // and populates `_remoteValues.error` with `null`. An `in` check
-      // would then suppress every dispatch — including local XHR failures
-      // the Core has no way to know about — silently swallowing the error
-      // event subscribers rely on.
-      const remoteErrorPublished = this._isRemote
-        && this._remoteValues.error != null;
-      if (!this._hasLocalError && !remoteErrorPublished) {
-        this._setErrorState(err);
-      }
+      // This used to skip the dispatch whenever `_hasLocalError` was set or
+      // the remote `error` slot was non-null. `_hasLocalError` stays set
+      // after a failed run until a successful one, so the next failed
+      // multipart run (local or remote) reported nothing at all; and the
+      // remote-slot check assumed a part re-sign failure is published by
+      // the Core, which it is not.
+      this._setTransferErrorState(err, run);
       throw err;
     }
 
+    const completeWindow = this._errorWindow(run);
     try {
       const downloadUrl = await this._completeMultipart(key, init.uploadId, completed);
       this._clearErrorState();
       return downloadUrl;
     } catch (e: unknown) {
-      this._setRpcErrorState(e);
+      this._setRpcErrorState(e, completeWindow);
       throw e;
     }
   }
@@ -1213,7 +1312,8 @@ export class S3 extends HTMLElement {
     // *while connected*, and at the next connect transition *while
     // disconnected*.
     if (this._isRemote && this._proxy) {
-      this._proxy.setWithAck(name, value).catch((e: unknown) => this._setErrorState(e));
+      const since = this._errorWindow();
+      this._proxy.setWithAck(name, value).catch((e: unknown) => this._setRpcErrorState(e, since));
     } else if (this._core) {
       // `_SYNC_INPUTS` members are literal keys of the relevant S3Core props
       // (all `string` typed). The `switch` lets TS narrow the assignment by
