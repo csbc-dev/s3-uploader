@@ -406,10 +406,12 @@ export class S3Core extends EventTarget {
     // `Error` is rejected by prototype — the previous non-enumerable
     // `toJSON` patch no longer helps, the validator ignores `toJSON` — and
     // so is a `stack: undefined` member. A rejected value is dropped with a
-    // server-side warning only, while the Shell defers to this mirror for
-    // every Core-side failure, so the browser saw no `s3-uploader:error` at
-    // all. The original value stays in `_errorSource` for in-process
-    // readers (`_localError`).
+    // server-side warning only, so the mirror never delivers it: the browser
+    // saw no `s3-uploader:error` at all while the Shell deferred every
+    // Core-side failure to this mirror, and since it dispatches failures it
+    // did not see published it gets only the bare RPC rejection instead.
+    // The original value stays in `_errorSource` for in-process readers
+    // (`_localError`).
     this._errorSource = normalised;
     this._error = toSerializedError(normalised);
     this._target.dispatchEvent(new CustomEvent("s3-uploader:error", { detail: this.error, bubbles: true }));

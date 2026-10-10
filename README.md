@@ -788,9 +788,17 @@ object or a string is turned into an `Error` with the same `name` /
 
 | failure | `s3-uploader:error` detail / `el.error` on a remote `<s3-uploader>` | `upload()` rejects with |
 |---|---|---|
-| inside the Core — provider rejection, fatal `registerPostProcess` hook, `completeMultipart` failure | plain `{ name, message }`, mirrored from `S3Core.error` (no class, no `stack`, no extra fields) — dispatched **once** | the `Error` that `RemoteCoreProxy` rebuilds from the throw envelope (`name`, `message`, a string `code` when the error had one, and whatever `stack` the server's `RemoteShellProxy` sends) |
+| inside the Core and published on its `error` — provider rejection, fatal `registerPostProcess` hook, `completeMultipart` failure | plain `{ name, message }`, mirrored from `S3Core.error` (no class, no `stack`, no extra fields) — dispatched **once** | the `Error` that `RemoteCoreProxy` rebuilds from the throw envelope (`name`, `message`, a string `code` when the error had one, and whatever `stack` the server's `RemoteShellProxy` sends) |
+| inside the Core but **not** published — argument / state validation (`bucket is required`, `complete() key mismatch`, `… without an active upload`), a request superseded by a newer one | that rebuilt `Error` — dispatched by the Shell, once | the same instance |
 | in the browser — `PutHttpError`, `MissingEtagError` | the real `Error` instance, dispatched by the Shell | the same instance |
 | in the remote layer, outside any Core command — `WC_BINDABLE_TIMEOUT`, `_DISPOSED`, `_TERMINAL_FAILURE`, `_INVALID_JSON_VALUE`, `_INVALID_RETURN_VALUE`, … | the `Error` from `@wc-bindable/remote`, with its `code` — dispatched by the Shell | the same instance |
+| the WebSocket failing to connect or dropping | `Error("[@csbc-dev/s3-uploader] WebSocket connection failed: <url>")` / `… connection lost: <url>`, dispatched by the Shell — once, however much was in flight | what the in-flight operation failed with as a consequence: `WC_BINDABLE_DISPOSED` for a pending Core command, `upload aborted.` for a cancelled PUT. These are **not** dispatched again. |
+
+Every failure produces exactly one `s3-uploader:error` — also under
+`trigger = true`, which swallows the `upload()` rejection. The Shell
+dispatches a failure itself unless it has already been delivered: by the
+Core's `error` mirror while that command was in flight, or by the
+WebSocket-failure event for the drop that caused it.
 
 `S3Core.error` itself (what server-side code reads, and the `detail` of the
 Core's own `s3-uploader:error`) is always the plain `{ name, message }`
